@@ -2013,9 +2013,6 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
                            fail_is_nan=False):
     """
     NOTE: modified by me to consider patches
-    * problem is that these routines are called on flattened arrays... so there is no spatial information, so how can we consider patches?
-      good chance that the setup for DiPy does not allow this idea... would have to write a completely new fitting class that does not flatten the data...
-
 
     Use the RESTORE algorithm [1]_ to calculate a robust tensor fit
 
@@ -2109,6 +2106,7 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
     this_param = np.zeros_like(ols_params)
     residuals = np.zeros(flat_data.shape)
     residuals_gmm = np.zeros(flat_data.shape)
+    robust = np.zeros(flat_data.shape, dtype=int)  # NOTE: this is here so we can save results to file from this function, needed because of DiPy structure
 
     # 1) do NLLS fitting for all voxels
     # ---------------------------------
@@ -2158,9 +2156,11 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
         # set sigma value
         if np.iterable(sigma):
-            sigma_vox = sigma[adj[vox]] if sigma.ndim > 1 else sigma  # NOTE: changed this to get neighbour sigma
+            sigma_vox = sigma[vox, 0] if sigma.ndim > 1 else sigma
+            sigma_mvox = sigma[adj[vox]] if sigma.ndim > 1 else sigma  # NOTE: changed this to get neighbour sigma
         else:
             sigma_vox = sigma
+            sigma_mvox = sigma
 
         try:
             # FIXME: need to store new residuals in a new place
@@ -2170,20 +2170,16 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
             # TODO: add new criterion, will need to modify sigma_vox too, something like residuals[acq[vox]] and sigma[acq[vox]], somehow...
 
             r_tmp = residuals[adj[vox]]
-            # FIXME: include measured covariance between voxels 
             if True:
-                ivar = np.diag(1.0/sigma_vox.flatten()**2)
+                ivar = np.diag(1.0/sigma_mvox.flatten()**2)
             else:
-                cov = np.cov(flat_data[adj[vox]]) + np.diag(sigma_vox.flatten()**2)
+                # covariance between voxels 
+                cov = np.cov(flat_data[adj[vox]]) + np.diag(sigma_mvox.flatten()**2)
                 ivar = np.linalg.inv(cov)
-            imp = np.einsum('ij,ji->i', (r_tmp.T).dot(ivar), r_tmp)  # FIXME: sigma -> variance, and inverse, do later...
+            imp = np.einsum('ij,ji->i', (r_tmp.T).dot(ivar), r_tmp)
 
-            #import IPython as ipy
-            #ipy.embed()
-
-            #       the trick is that we have multiple voxels to consider now, need to see if any image satisfies the new multi-voxel critereon
-            #if np.any(np.abs(residuals[vox]) > 3 * sigma_vox): # NOTE: replace this in a moment....
-            if np.any(imp > chi2.ppf(0.997, df=len(adj[vox]))):
+            cond = (imp > chi2.ppf(0.997, df=len(adj[vox]))) | (np.abs(residuals[vox]) > 3 * sigma_vox)
+            if np.any(cond):
                 # Do nlls with GMM-weighting:
                 if jac:
                     this_param[vox], status = opt.leastsq(_nlls_err_func,
@@ -2211,44 +2207,34 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
     # 3) do NLLS fitting for all voxels on clean data
     # -----------------------------------------------
     # now need to update residuals with the gmm results
-    cond = np.all(residuals_gmm != 0, axis=1)
+    cond = np.all(residuals_gmm != 0, axis=1)  # FIXME: note an ideal way to update the residuals with GMM versions...
     residuals[cond] = residuals_gmm[cond] 
     for vox in range(flat_data.shape[0]):
 
         # set sigma value
         if np.iterable(sigma):
-            sigma_vox = sigma[adj[vox]] if sigma.ndim > 1 else sigma  # NOTE: changed this to get neighbour sigma
+            sigma_vox = sigma[vox, 0] if sigma.ndim > 1 else sigma
+            sigma_mvox = sigma[adj[vox]] if sigma.ndim > 1 else sigma  # NOTE: changed this to get neighbour sigma
         else:
             sigma_vox = sigma
+            sigma_mvox = sigma
 
         try:
             r_tmp = residuals[adj[vox]]  # NOTE: using 'residuals' here, since it should be updated
             if True:
-                ivar = np.diag(1.0/sigma_vox.flatten()**2)
+                ivar = np.diag(1.0/sigma_mvox.flatten()**2)
             else:
-                cov = np.cov(flat_data[adj[vox]]) + np.diag(sigma_vox.flatten()**2)
+                cov = np.cov(flat_data[adj[vox]]) + np.diag(sigma_mvox.flatten()**2)
                 ivar = np.linalg.inv(cov)
             imp = np.einsum('ij,ji->i', (r_tmp.T).dot(ivar), r_tmp)  # FIXME: sigma -> variance, and inverse, do later...
 
-            # set sigma value # NOTE: need to update sigma_vox to be just for this voxel, for the weighting in NLLS fit
-            if np.iterable(sigma):
-                sigma_vox = sigma[vox, 0] if sigma.ndim > 1 else sigma
-            else:
-                sigma_vox = sigma
-
-            #import IPython as ipy
-            #ipy.embed()
-
-            #       the trick is that we have multiple voxels to consider now, need to see if any image satisfies the new multi-voxel critereon
-            #if np.any(np.abs(residuals[vox]) > 3 * sigma_vox): # NOTE: replace this in a moment....
-            cond = imp > chi2.ppf(0.997, df=len(adj[vox]))
+            cond = (imp > chi2.ppf(0.997, df=len(adj[vox]))) | (np.abs(residuals[vox]) > 3 * sigma_vox)
             if np.any(cond):
                 # If you still have outliers, refit without those outliers:
-                non_outlier_idx = np.where(imp <= chi2.ppf(0.997, df=len(adj[vox])))
-                #non_outlier_idx = np.where(np.abs(residuals[vox]) <=
-                #                           3 * sigma_vox)
+                non_outlier_idx = np.where(cond == False)
                 clean_design = design_matrix[non_outlier_idx]
                 clean_data = flat_data[vox][non_outlier_idx]
+                robust[vox] = (cond == False)  # NOTE: attempt to save robust results
 
                 # recalculate OLS solution with clean data
                 new_start = ols_fit_tensor(clean_design, clean_data,
@@ -2303,6 +2289,15 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
     if resort_to_OLS:
         warnings.warn("Resorted to OLS solution in some voxels", UserWarning)
+
+    # FIXME: saving robust results to file, because there is no simple way to retrieve them otherwise
+    from os.path import exists
+    rfile = "robust.npy"
+    robust = robust.reshape(data_shape)
+    if exists(rfile):
+        tmp = np.load(rfile)
+        robust = np.dstack([tmp, robust])
+    np.save(rfile, robust)
 
     params.shape = data.shape[:-1] + (npa,)
     if return_S0_hat:
