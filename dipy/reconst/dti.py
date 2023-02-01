@@ -9,6 +9,7 @@ import numpy as np
 
 import scipy.optimize as opt
 from scipy.stats import chi2
+from scipy.spatial.distance import pdist, squareform
 
 from dipy.utils.arrfuncs import pinv
 from dipy.data import get_sphere
@@ -674,6 +675,50 @@ def tensor_prediction(dti_params, gtab, S0):
     return np.exp(np.dot(lower_tri, D.T))
 
 
+def adjacency_calc(img_shape, mask):
+    r"""Create adjacency list for voxels, accounting for the mask.
+
+    Parameters
+    ----------
+
+    img_shape : list
+        Spatial shape of the image data.
+
+    mask : array
+        A boolean array used to mark the coordinates in the data that
+        should be analyzed that should have the same shape as the images.
+
+    Returns
+    -------
+
+    adj : list
+        List, one entry per voxel, giving the indices of adjacent voxels.
+        The list will correspond to the data array once masked and flattened.
+
+    """
+
+    # Image-space coordinates of voxels, flattened
+    XYZ = np.meshgrid(*[range(ds) for ds in img_shape], indexing='ij')
+    XYZ = np.column_stack([xyz.ravel() for xyz in XYZ])
+    dists = squareform(pdist(XYZ))
+    dists = (dists < 2)  # NOTE: adjaceny list will contain the voxel itself
+    adj = []
+    if mask is not None:
+        flat_mask = mask.reshape(-1)
+        for idx in range(dists.shape[0]):
+            if flat_mask[idx]:
+                cond = dists[idx, :]
+                cond = cond * flat_mask
+                cond = cond[flat_mask]  # so indices will match masked array 
+                adj.append(np.argwhere(cond).flatten().tolist())
+    else:
+        for idx in range(dists.shape[0]):
+            cond = dists[idx, :]
+            adj.append(np.argwhere(cond).flatten().tolist())
+
+    return adj   
+
+
 class TensorModel(ReconstModel):
     """ Diffusion Tensor
     """
@@ -758,7 +803,7 @@ class TensorModel(ReconstModel):
             e_s += " positive."
             raise ValueError(e_s)
 
-    def fit(self, data, mask=None):
+    def fit(self, data, mask=None, adjacency=False):
         """ Fit method of the DTI model class
 
         Parameters
@@ -770,16 +815,23 @@ class TensorModel(ReconstModel):
             A boolean array used to mark the coordinates in the data that
             should be analyzed that has the shape data.shape[:-1]
 
+        adjacency : bool
+            Boolean to calculate voxel adjacency accounting for mask.
         """
-        self.kwargs["data_shape"] = data.shape  # NOTE: new, to record the original size of data before flattening
+
         S0_params = None
 
+        img_shape = data.shape[:-1]
         if mask is not None:
             # Check for valid shape of the mask
-            if mask.shape != data.shape[:-1]:
+            if mask.shape != img_shape:
                 raise ValueError("Mask is not the same shape as data.")
             mask = np.array(mask, dtype=bool, copy=False)
         data_in_mask = np.reshape(data[mask], (-1, data.shape[-1]))
+
+        # NOTE: build adjacency list, if required - could make a list somewhere that notes whether this is required for a particular algorithm
+        if adjacency:
+            self.kwargs["adjacency"] = adjacency_calc(img_shape, mask)
 
         if "sigma" in self.kwargs:
             sigma = self.kwargs["sigma"]
@@ -1341,7 +1393,7 @@ def iter_fit_tensor(step=1e4):
 
 
 @iter_fit_tensor()
-def wls_fit_tensor(design_matrix, data, return_S0_hat=False, data_shape=None):
+def wls_fit_tensor(design_matrix, data, return_S0_hat=False, adjacency=None):
     r"""
     Computes weighted least squares (WLS) fit to calculate self-diffusion
     tensor using a linear regression model [1]_.
@@ -1356,8 +1408,8 @@ def wls_fit_tensor(design_matrix, data, return_S0_hat=False, data_shape=None):
         dimension should contain the data. It makes no copies of data.
     return_S0_hat : bool
         Boolean to return (True) or not (False) the S0 values for the fit.
-    data_shape : list
-        Shape of the diffusion tensor data prior to flattening.
+    adjacency : list
+        Adjacency list matching the flattened and masked array data array.
 
     Returns
     -------
@@ -1434,7 +1486,7 @@ def wls_fit_tensor(design_matrix, data, return_S0_hat=False, data_shape=None):
 
 @iter_fit_tensor()
 def ols_fit_tensor(design_matrix, data, return_S0_hat=False,
-                   data_shape=None, return_lower_triangular=False):
+                   adjacency=None, return_lower_triangular=False):
     r"""
     Computes ordinary least squares (OLS) fit to calculate self-diffusion
     tensor using a linear regression model [1]_.
@@ -1449,8 +1501,8 @@ def ols_fit_tensor(design_matrix, data, return_S0_hat=False,
         dimension should contain the data. It makes no copies of data.
     return_S0_hat : bool
         Boolean to return (True) or not (False) the S0 values for the fit.
-    data_shape : list
-        Shape of the diffusion tensor data prior to flattening.
+    adjacency : list
+        Adjacency list matching the flattened and masked array data array.
     return_lower_triangular : bool
         Boolean to return (True) or not (False) the coefficients of the fit.
 
@@ -1674,7 +1726,7 @@ def _decompose_tensor_nan(tensor, tensor_alternative, min_diffusivity=0):
 
 def nlls_fit_tensor(design_matrix, data, weighting=None,
                     sigma=None, jac=True, return_S0_hat=False,
-                    data_shape=None, fail_is_nan=False):
+                    adjacency=None, fail_is_nan=False):
     """
     Fit the cumulant expansion params (e.g. DTI, DKI) using non-linear
     least-squares.
@@ -1708,8 +1760,8 @@ def nlls_fit_tensor(design_matrix, data, weighting=None,
     return_S0_hat : bool
         Boolean to return (True) or not (False) the S0 values for the fit.
 
-    data_shape : list
-        Shape of the diffusion tensor data prior to flattening.
+    adjacency : list
+        Adjacency list matching the flattened and masked array data array.
 
     fail_is_nan : bool
         Boolean to set failed NL fitting to NaN (True) or LS (False, default).
@@ -1807,7 +1859,7 @@ def nlls_fit_tensor(design_matrix, data, weighting=None,
 
 
 def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
-                       return_S0_hat=False, data_shape=None,
+                       return_S0_hat=False, adjacency=None,
                        fail_is_nan=False):
     """
     Use the RESTORE algorithm [1]_ to calculate a robust tensor fit
@@ -1839,8 +1891,8 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
     return_S0_hat : bool
         Boolean to return (True) or not (False) the S0 values for the fit.
 
-    data_shape : list
-        Shape of the diffusion tensor data prior to flattening.
+    adjacency : list
+        Adjacency list matching the flattened and masked array data array.
 
     fail_is_nan : bool
         Boolean to set failed NL fitting to NaN (True) or LS (False, default).
@@ -2009,7 +2061,7 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
 
 def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
-                           return_S0_hat=False, data_shape=None,
+                           return_S0_hat=False, adjacency=None,
                            fail_is_nan=False):
     """
     NOTE: modified by me to consider patches
@@ -2043,8 +2095,8 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
     return_S0_hat : bool
         Boolean to return (True) or not (False) the S0 values for the fit.
 
-    data_shape : list
-        Shape of the diffusion tensor data prior to flattening.
+    adjacency : list
+        Adjacency list matching the flattened and masked array data array.
 
     fail_is_nan : bool
         Boolean to set failed NL fitting to NaN (True) or LS (False, default).
@@ -2072,22 +2124,6 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
         if sigma.ndim > 1:  # spatially varying
             sigma = np.reshape(sigma, (-1, 1))
 
-    # Calculate voxel adjacency matrix from data_shape
-    from scipy.spatial.distance import pdist, squareform  # TODO: move to module list
-    XYZ = np.meshgrid(*[range(ds) for ds in data_shape[:-1]], indexing='ij')  # NOTE: not data.shape!
-    XYZ = np.column_stack([xyz.ravel() for xyz in XYZ])
-    dists = squareform(pdist(XYZ))
-#    import IPython as ipy
-#    ipy.embed()
-    dists = (dists < 2)  # NOTE: adjaceny list will contain the voxel itself (which has distance 0)
-    adj = []
-    for idx in range(dists.shape[0]):
-        adj.append(np.argwhere(dists[idx,:]).flatten().tolist())
-        #print(idx, adj[-1])
-    #print(adj)
-    del XYZ, dists
-        
-
     # calculate OLS solution
     D = ols_fit_tensor(design_matrix, flat_data, return_lower_triangular=True)
 
@@ -2105,8 +2141,13 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
     this_param = np.zeros_like(ols_params)
     residuals = np.zeros(flat_data.shape)
+
+    # NOTE: new for alt_restore
     residuals_gmm = np.zeros(flat_data.shape)
     robust = np.zeros(flat_data.shape, dtype=int)  # NOTE: this is here so we can save results to file from this function, needed because of DiPy structure
+    if adjacency is None:
+        raise ValueError("adjacency must not be None")
+    adj = adjacency
 
     # 1) do NLLS fitting for all voxels
     # ---------------------------------
@@ -2291,13 +2332,14 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
         warnings.warn("Resorted to OLS solution in some voxels", UserWarning)
 
     # FIXME: saving robust results to file, because there is no simple way to retrieve them otherwise
-    from os.path import exists
-    rfile = "robust.npy"
-    robust = robust.reshape(data_shape)
-    if exists(rfile):
-        tmp = np.load(rfile)
-        robust = np.dstack([tmp, robust])
-    np.save(rfile, robust)
+    # FIXME: will have to figure out how to make this work! 'robust' may be returnable now, somehow, since adjacency is outside of this function
+#    from os.path import exists
+#    rfile = "robust.npy"
+#    robust = robust.reshape(data_shape)
+#    if exists(rfile):
+#        tmp = np.load(rfile)
+#        robust = np.dstack([tmp, robust])
+#    np.save(rfile, robust)
 
     params.shape = data.shape[:-1] + (npa,)
     if return_S0_hat:
