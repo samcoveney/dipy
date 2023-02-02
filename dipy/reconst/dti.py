@@ -864,7 +864,7 @@ class TensorModel(ReconstModel):
 
         data_in_mask = np.maximum(data_in_mask, min_signal)
 
-        params_in_mask = self.fit_method(
+        params_in_mask, extra = self.fit_method(
                 self.design_matrix,
                 data_in_mask,
                 return_S0_hat=self.return_S0_hat,
@@ -878,12 +878,17 @@ class TensorModel(ReconstModel):
             dti_params = params_in_mask.reshape(out_shape)
             if self.return_S0_hat:
                 S0_params = model_S0.reshape(out_shape[:-1])
+            if extra is not None:
+                self.extra = extra.reshape(data.shape)
         else:
             dti_params = np.zeros(data.shape[:-1] + (12,))
             dti_params[mask, :] = params_in_mask
             if self.return_S0_hat:
                 S0_params = np.zeros(data.shape[:-1])
                 S0_params[mask] = model_S0.squeeze()
+            if extra is not None:
+                self.extra = np.zeros(data.shape)
+                self.extra[mask, :] = extra
 
         return TensorFit(self, dti_params, model_S0=S0_params)
 
@@ -1370,22 +1375,25 @@ def iter_fit_tensor(step=1e4):
             dtiparams = np.empty((size, 12), dtype=np.float64)
             if return_S0_hat:
                 S0params = np.empty(size, dtype=np.float64)
+            extra = np.empty(data.shape)
             for i in range(0, size, step):
                 if return_S0_hat:
-                    dtiparams[i:i + step], S0params[i:i + step] \
+                    (dtiparams[i:i + step], S0params[i:i + step]),\
+                    extra[i:i + step]\
                         = fit_tensor(design_matrix,
                                      data[i:i + step],
                                      return_S0_hat=return_S0_hat,
                                      *args, **kwargs)
                 else:
-                    dtiparams[i:i + step] = fit_tensor(design_matrix,
-                                                       data[i:i + step],
-                                                       *args, **kwargs)
+                    dtiparams[i:i + step], extra[i:i + step]\
+                        = fit_tensor(design_matrix,
+                                     data[i:i + step],
+                                     *args, **kwargs)
             if return_S0_hat:
                 return (dtiparams.reshape(shape + (12, )),
-                        S0params.reshape(shape + (1, )))
+                        S0params.reshape(shape + (1, ))), extra.reshape(shape + (-1,))
             else:
-                return dtiparams.reshape(shape + (12, ))
+                return dtiparams.reshape(shape + (12, )), extra.reshape(shape + (-1,))
 
         return wrapped_fit_tensor
 
@@ -1478,10 +1486,10 @@ def wls_fit_tensor(design_matrix, data, return_S0_hat=False, adjacency=None):
     if return_S0_hat:
         return (eig_from_lo_tri(fit_result,
                                 min_diffusivity=tol / -design_matrix.min()),
-                np.exp(-fit_result[:, -1]))
+                np.exp(-fit_result[:, -1])), None
     else:
         return eig_from_lo_tri(fit_result,
-                               min_diffusivity=tol / -design_matrix.min())
+                               min_diffusivity=tol / -design_matrix.min()), None
 
 
 @iter_fit_tensor()
@@ -1546,10 +1554,10 @@ def ols_fit_tensor(design_matrix, data, return_S0_hat=False,
     if return_S0_hat:
         return (eig_from_lo_tri(fit_result,
                                 min_diffusivity=tol / -design_matrix.min()),
-                np.exp(-fit_result[:, -1]))
+                np.exp(-fit_result[:, -1])), None
     else:
         return eig_from_lo_tri(fit_result,
-                               min_diffusivity=tol / -design_matrix.min())
+                               min_diffusivity=tol / -design_matrix.min()), None
 
 
 def _ols_fit_matrix(design_matrix):
@@ -1853,9 +1861,9 @@ def nlls_fit_tensor(design_matrix, data, weighting=None,
     params.shape = data.shape[:-1] + (npa,)
     if return_S0_hat:
         model_S0.shape = data.shape[:-1] + (1,)
-        return params, model_S0
+        return [params, model_S0], None
     else:
-        return params
+        return params, None
 
 
 def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
@@ -1929,6 +1937,9 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
     # Initialize parameter matrix
     params = np.empty((flat_data.shape[0], npa))
 
+    # For storing whether image is used in final fit for each voxel
+    robust = np.ones(flat_data.shape, dtype=int)
+
     # For warnings
     resort_to_OLS = False
 
@@ -1988,12 +1999,13 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 # Recalculate residuals given gmm fit
                 pred_sig = np.exp(np.dot(design_matrix, this_param))
                 residuals = flat_data[vox] - pred_sig
-                if np.any(np.abs(residuals) > 3 * sigma_vox):
+                cond = np.abs(residuals) > 3 * sigma_vox
+                if np.any(cond):
                     # If you still have outliers, refit without those outliers:
-                    non_outlier_idx = np.where(np.abs(residuals) <=
-                                               3 * sigma_vox)
+                    non_outlier_idx = np.where(cond == False)
                     clean_design = design_matrix[non_outlier_idx]
                     clean_data = flat_data[vox][non_outlier_idx]
+                    robust[vox] = (cond == False)
 
                     # recalculate OLS solution with clean data
                     new_start = ols_fit_tensor(clean_design, clean_data,
@@ -2055,9 +2067,9 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
     params.shape = data.shape[:-1] + (npa,)
     if return_S0_hat:
         model_S0.shape = data.shape[:-1] + (1,)
-        return params, model_S0
+        return [params, model_S0], robust
     else:
-        return params
+        return params, robust
 
 
 def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
@@ -2144,7 +2156,7 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
     # NOTE: new for alt_restore
     residuals_gmm = np.zeros(flat_data.shape)
-    robust = np.zeros(flat_data.shape, dtype=int)  # NOTE: this is here so we can save results to file from this function, needed because of DiPy structure
+    robust = np.ones(flat_data.shape, dtype=int)  # NOTE: this is here so we can save results to file from this function, needed because of DiPy structure
     if adjacency is None:
         raise ValueError("adjacency must not be None")
     adj = adjacency
@@ -2344,9 +2356,9 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
     params.shape = data.shape[:-1] + (npa,)
     if return_S0_hat:
         model_S0.shape = data.shape[:-1] + (1,)
-        return params, model_S0
+        return [params, model_S0], robust
     else:
-        return params
+        return params, robust
 
 
 _lt_indices = np.array([[0, 1, 3],
