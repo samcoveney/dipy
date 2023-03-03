@@ -1934,6 +1934,9 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
     estimation of tensors by outlier rejection. MRM, 53: 1088-95.
 
     """
+    # TODO
+    # - must work with sigma as scalar, or sigma for each image, and so on
+
     # Detect number of parameters to estimate from design_matrix length plus
     # 5 due to diffusion tensor conversion to eigenvalue and eigenvectors
     npa = design_matrix.shape[-1] + 5
@@ -2179,7 +2182,7 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
             sigma = np.reshape(sigma, (-1, 1))
 
     # calculate OLS solution
-    D = ols_fit_tensor(design_matrix, flat_data, return_lower_triangular=True)
+    D, _ = ols_fit_tensor(design_matrix, flat_data, return_lower_triangular=True)
 
     # Flatten for the iteration over voxels:
     ols_params = np.reshape(D, (-1, D.shape[-1]))
@@ -2332,7 +2335,7 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 robust[vox] = (cond == False)  # NOTE: attempt to save robust results
 
                 # recalculate OLS solution with clean data
-                new_start = ols_fit_tensor(clean_design, clean_data,
+                new_start, _ = ols_fit_tensor(clean_design, clean_data,
                                            return_lower_triangular=True)
 
                 if np.iterable(sigma_vox):
