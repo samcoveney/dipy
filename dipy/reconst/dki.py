@@ -1627,15 +1627,20 @@ class DiffusionKurtosisModel(ReconstModel):
             min_signal = self.min_signal
 
         data_in_mask = np.maximum(data_in_mask, min_signal)
-        params_in_mask = self.fit_method(self.design_matrix, data_in_mask,
+        params_in_mask, extra = self.fit_method(self.design_matrix, data_in_mask,
                                          *self.args, **self.kwargs)
 
         if mask is None:
             out_shape = data.shape[:-1] + (-1, )
             dki_params = params_in_mask.reshape(out_shape)
+            if extra is not None:
+                self.extra = extra.reshape(data.shape)
         else:
             dki_params = np.zeros(data.shape[:-1] + (27,))
             dki_params[mask, :] = params_in_mask
+            if extra is not None:
+                self.extra = np.zeros(data.shape)
+                self.extra[mask, :] = extra
 
         return DiffusionKurtosisFit(self, dki_params)
 
@@ -2219,7 +2224,7 @@ def ols_fit_dki(design_matrix, data):
     # Reshape data according to the input data shape
     dki_params = dki_params.reshape((data.shape[:-1]) + (27,))
 
-    return dki_params
+    return dki_params, None
 
 
 def _wls_iter(design_matrix, inv_design, sig, min_diffusivity):
@@ -2279,7 +2284,7 @@ def _wls_iter(design_matrix, inv_design, sig, min_diffusivity):
     dki_params = np.concatenate((evals, evecs[0], evecs[1], evecs[2],
                                  KT_elements), axis=0)
 
-    return dki_params
+    return dki_params, None
 
 
 def wls_fit_dki(design_matrix, data):
@@ -2327,13 +2332,13 @@ def wls_fit_dki(design_matrix, data):
 
     # looping WLS solution on all data voxels
     for vox in range(len(data_flat)):
-        dki_params[vox] = _wls_iter(design_matrix, inv_design, data_flat[vox],
+        dki_params[vox], _ = _wls_iter(design_matrix, inv_design, data_flat[vox],
                                     min_diffusivity)
 
     # Reshape data according to the input data shape
     dki_params = dki_params.reshape((data.shape[:-1]) + (27,))
 
-    return dki_params
+    return dki_params, None
 
 
 def Wrotate(kt, Basis):
