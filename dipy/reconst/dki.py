@@ -1628,7 +1628,7 @@ class DiffusionKurtosisModel(ReconstModel):
 
         data_in_mask = np.maximum(data_in_mask, min_signal)
         params_in_mask, extra = self.fit_method(self.design_matrix, data_in_mask,
-                                         *self.args, **self.kwargs)
+                                                *self.args, **self.kwargs)
 
         if mask is None:
             out_shape = data.shape[:-1] + (-1, )
@@ -2332,8 +2332,8 @@ def wls_fit_dki(design_matrix, data):
 
     # looping WLS solution on all data voxels
     for vox in range(len(data_flat)):
-        dki_params[vox], _ = _wls_iter(design_matrix, inv_design, data_flat[vox],
-                                    min_diffusivity)
+        dki_params[vox], _ = _wls_iter(design_matrix, inv_design,
+                                       data_flat[vox], min_diffusivity)
 
     # Reshape data according to the input data shape
     dki_params = dki_params.reshape((data.shape[:-1]) + (27,))

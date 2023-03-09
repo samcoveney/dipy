@@ -375,7 +375,7 @@ class KurtosisMicrostructureModel(DiffusionKurtosisModel):
         data_in_mask = np.maximum(data_in_mask, self.min_signal)
 
         # DKI fit
-        dki_params = self.fit_method(self.design_matrix, data_in_mask,
+        dki_params, extra = self.fit_method(self.design_matrix, data_in_mask,
                                      *self.args, **self.kwargs)
 
         # Computing awf
@@ -394,9 +394,14 @@ class KurtosisMicrostructureModel(DiffusionKurtosisModel):
         if mask is None:
             out_shape = data.shape[:-1] + (-1,)
             params = params_all_mask.reshape(out_shape)
+            if extra is not None:
+                self.extra = extra.reshape(data.shape)
         else:
             params = np.zeros(data.shape[:-1] + (params_all_mask.shape[-1],))
             params[mask, :] = params_all_mask
+            if extra is not None:
+                self.extra = np.zeros(data.shape)
+                self.extra[mask, :] = extra
 
         return KurtosisMicrostructuralFit(self, params)
 
