@@ -2117,13 +2117,11 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
         return params, robust
 
 
-def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
-                           return_S0_hat=False, adjacency=None,
-                           fail_is_nan=False):
+def prestore_fit_tensor(design_matrix, data, sigma=None, jac=True,
+                        return_S0_hat=False, adjacency=None,
+                        fail_is_nan=False):
     """
-    NOTE: modified by me to consider patches
-
-    Use the RESTORE algorithm [1]_ to calculate a robust tensor fit
+    Use the pRESTORE algorithm [1]_ to calculate a robust tensor fit.
 
     Parameters
     ----------
@@ -2199,12 +2197,15 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
     this_param = np.zeros_like(ols_params)
     residuals = np.zeros(flat_data.shape)
 
-    # NOTE: new for alt_restore
+    # NOTE: new for prestore
     residuals_gmm = np.zeros(flat_data.shape)
     robust = np.ones(flat_data.shape, dtype=int)  # NOTE: this is here so we can save results to file from this function, needed because of DiPy structure
     if adjacency is None:
         raise ValueError("adjacency must not be None")
     adj = adjacency
+
+    # Instance of _nlls_class, need for nlls error func and jacobian
+    nlls = _nlls_class()
 
     # 1) do NLLS fitting for all voxels
     # ---------------------------------
@@ -2224,14 +2225,14 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
             # Do nlls using sigma weighting in this voxel:
             if jac:
-                this_param[vox], status = opt.leastsq(_nlls_err_func, start_params,
+                this_param[vox], status = opt.leastsq(nlls.err_func, start_params,
                                                  args=(design_matrix,
                                                        flat_data[vox],
                                                        'sigma',
                                                        sigma_vox),
-                                                 Dfun=_nlls_jacobian_func)
+                                                 Dfun=nlls.jacobian_func)
             else:
-                this_param[vox], status = opt.leastsq(_nlls_err_func, start_params,
+                this_param[vox], status = opt.leastsq(nlls.err_func, start_params,
                                                  args=(design_matrix,
                                                        flat_data[vox],
                                                        'sigma',
@@ -2278,24 +2279,71 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
             cond = (imp > chi2.ppf(0.997, df=len(adj[vox]))) | (np.abs(residuals[vox]) > 3 * sigma_vox)
             if np.any(cond):
-                # Do nlls with GMM-weighting:
-                if jac:
-                    this_param[vox], status = opt.leastsq(_nlls_err_func,
-                                                     start_params,
-                                                     args=(design_matrix,
-                                                           flat_data[vox],
-                                                           'gmm'),
-                                                     Dfun=_nlls_jacobian_func)
-                else:
-                    this_param[vox], status = opt.leastsq(_nlls_err_func,
-                                                     start_params,
-                                                     args=(design_matrix,
-                                                           flat_data[vox],
-                                                           'gmm'))
 
-                # Recalculate residuals given gmm fit
-                pred_sig = np.exp(np.dot(design_matrix, this_param[vox]))
-                residuals_gmm[vox] = flat_data[vox] - pred_sig
+                # 1. robustly estimate C from current residuals
+                # 2. Use NLLS with GMM weighting. Weights are updated during optimization based on residuals at each step in opt.leastsq, using fixed C,
+                #    which means that derivative of the loss function is continuous (not true if C is recalculated at each step).
+                # 3. calculate difference in new vs old parameter estimate, and return to 1 if not converged.
+                # (NOTE: this implementation is in contrast to completely fixing the weights in step 1)
+                rdx = 1
+                while rdx <= 10:  # NOTE: capped at 10 iterations
+                    if rdx == 1:
+                        C = 1.4826 * np.median(np.abs(residuals[vox] - np.median(residuals[vox])))
+                    else:
+                        C = 1.4826 * np.median(np.abs(residuals_gmm[vox] - np.median(residuals_gmm[vox])))
+
+                    # Do nlls with GMM-weighting:
+                    if jac:
+                        this_param[vox], status = opt.leastsq(nlls.err_func,
+                                                         start_params,
+                                                         args=(design_matrix,
+                                                               flat_data[vox],
+                                                               'gmm',
+                                                               C),
+                                                         Dfun=nlls.jacobian_func)
+                    else:
+                        this_param[vox], status = opt.leastsq(nlls.err_func,
+                                                         start_params,
+                                                         args=(design_matrix,
+                                                               flat_data[vox],
+                                                               'gmm',
+                                                               C))
+
+                    # Recalculate residuals given gmm fit
+                    pred_sig = np.exp(np.dot(design_matrix, this_param[vox]))
+                    residuals_gmm[vox] = flat_data[vox] - pred_sig
+                    perc = 100 * np.linalg.norm(this_param[vox] - start_params) / np.linalg.norm(this_param[vox])
+                    start_params = this_param[vox]
+                    #print("rdx:", rdx, this_param[vox])
+                    #print("percentage difference:", perc, "%")
+                    #print(status)
+                    if perc < 0.1: break
+                    rdx = rdx + 1
+
+
+#                # calculate leverages from weighted linear problem (by using log(data) and log(non-linear predictions))
+#                # -----------------------------------------------------------------------------------------------------
+#                # NOTE: this is to see if we can prevent removal of some important data that lead to a corruption of the final result
+#                # NOTE: something going wrong here, some pred_sig are EXACTLY the same as the observed data (at least on log space)
+#                log_s = np.log(flat_data[vox])
+#                print("log_s:", log_s)
+#                print("log_pred:", np.log(pred_sig))
+#                resid_logs = log_s - np.log(pred_sig)
+#                C = 1.4826 * np.median(np.abs(resid_logs - np.median(resid_logs)))
+#                C = C / pred_sig # adjust for log problem
+#                print("C:", C)
+#                print("resid_logs:", resid_logs)
+#                w = 1.0 / np.sqrt(C**2 + resid_logs**2)  # to use as X -> sqrt(W)X
+#                print(w)
+#
+#                if Version(np.__version__) < Version('1.14'):
+#                    hat = design_matrix @ pinv(design_matrix * w[..., None])
+#                else:
+#                    hat = design_matrix @ np.linalg.pinv(design_matrix * w[..., None])
+#
+#                lev = np.diag(hat)
+#                print(lev)
+            
 
         # restort to OLS solution if NLLS fails
         except (np.linalg.LinAlgError, TypeError) as e:
@@ -2305,7 +2353,7 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
     # 3) do NLLS fitting for all voxels on clean data
     # -----------------------------------------------
     # now need to update residuals with the gmm results
-    cond = np.all(residuals_gmm != 0, axis=1)  # FIXME: note an ideal way to update the residuals with GMM versions...
+    cond = np.all(residuals_gmm != 0, axis=1)  # FIXME: NOT an ideal way to update the residuals with GMM versions...
     residuals[cond] = residuals_gmm[cond] 
     for vox in range(flat_data.shape[0]):
 
@@ -2344,15 +2392,15 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
                     this_sigma = sigma_vox
 
                 if jac:
-                    this_param[vox], status = opt.leastsq(_nlls_err_func,
+                    this_param[vox], status = opt.leastsq(nlls.err_func,
                                                      new_start,
                                                      args=(clean_design,
                                                            clean_data,
                                                            'sigma',
                                                            this_sigma),
-                                                     Dfun=_nlls_jacobian_func)
+                                                     Dfun=nlls.jacobian_func)
                 else:
-                    this_param[vox], status = opt.leastsq(_nlls_err_func,
+                    this_param[vox], status = opt.leastsq(nlls.err_func,
                                                      new_start,
                                                      args=(clean_design,
                                                            clean_data,
@@ -2387,16 +2435,6 @@ def alt_restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
     if resort_to_OLS:
         warnings.warn("Resorted to OLS solution in some voxels", UserWarning)
-
-    # FIXME: saving robust results to file, because there is no simple way to retrieve them otherwise
-    # FIXME: will have to figure out how to make this work! 'robust' may be returnable now, somehow, since adjacency is outside of this function
-#    from os.path import exists
-#    rfile = "robust.npy"
-#    robust = robust.reshape(data_shape)
-#    if exists(rfile):
-#        tmp = np.load(rfile)
-#        robust = np.dstack([tmp, robust])
-#    np.save(rfile, robust)
 
     params.shape = data.shape[:-1] + (npa,)
     if return_S0_hat:
@@ -2614,6 +2652,6 @@ common_fit_methods = {'WLS': wls_fit_tensor,
                       'RT': restore_fit_tensor,
                       'restore': restore_fit_tensor,
                       'RESTORE': restore_fit_tensor,
-                      'altrestore': alt_restore_fit_tensor,
-                      'ALTRESTORE': alt_restore_fit_tensor
+                      'prestore': prestore_fit_tensor,
+                      'PRESTORE': prestore_fit_tensor
                       }
