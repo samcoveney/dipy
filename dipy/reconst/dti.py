@@ -22,6 +22,7 @@ from dipy.utils.volume import adjacency_calc
 import matplotlib.pyplot as plt
 from scipy.linalg import eigh
 from scipy.spatial.distance import cdist
+from scipy.stats import chi2
 
 MIN_POSITIVE_SIGNAL = 0.0001
 
@@ -2089,7 +2090,7 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
     p = design_matrix.shape[-1]
     N = data.shape[-1]
 
-    # TODO: calculate condition for whether to do IRLS with M-estimtor
+    # condition for doing robust estimation
     lc = 1 - 3 * np.sqrt(2 / (N - p))            
     uc = 1 + 3 * np.sqrt(2 / (N - p))
 
@@ -2112,7 +2113,8 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
     # Initialize parameter matrix
     params = np.empty((flat_data.shape[0], npa))
-    # NOTE: save flattened params so we can do patch-test
+
+    # NOTE: save flattened params and C, for multivariate patch test
     params_7 = np.empty((flat_data.shape[0], 7))
     C_all = np.empty(flat_data.shape[0])
 
@@ -2124,6 +2126,7 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
     # Instance of _nlls_class, need for nlls error func and jacobian
     nlls = _nlls_class()
+    Dfun = nlls.jacobian_func if jac else None
 
     if return_S0_hat:
         model_S0 = np.empty((flat_data.shape[0], 1))
@@ -2137,17 +2140,11 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
             # NLLS estimation for this voxel
             if not(linear):
-                if jac:
-                    this_param, status = opt.leastsq(nlls.err_func, start_params,
-                                                     args=(design_matrix,
-                                                           flat_data[vox],
-                                                           None),
-                                                     Dfun=nlls.jacobian_func)
-                else:
-                    this_param, status = opt.leastsq(nlls.err_func, start_params,
-                                                     args=(design_matrix,
-                                                           flat_data[vox],
-                                                           None))
+                this_param, status = opt.leastsq(nlls.err_func, start_params,
+                                                 args=(design_matrix,
+                                                       flat_data[vox],
+                                                       None),
+                                                 Dfun=Dfun)
             else:
                 # will be WLS solution
                 this_param = start_params
@@ -2169,90 +2166,60 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 # NOTE: C deviates from eq 9 in IRLLS paper, but I think they have a typo,
                 C = factor * np.median(np.abs(z - np.median(z)))
 
-            # chi-squared statistic - use signal for NL or L
-            # don't know equivalent statistic for weighted residuals of log
+            # chi-squared statistic - use signal (not log signal)
             Xsq = (1 / (N - p)) * np.sum(residuals**2 / C**2)
-
-            # prints to help debug
-            #print("C:", C)  # looks good
-            
-            # If any of the residuals are outliers (using 3 sigma as a
-            # criterion following Chang et al., e.g page 1089):
             cond_r = (Xsq < lc) or (Xsq > uc)
-#            print(cond_r)
-#            if cond_r == False:
-#                print("vox:", vox, "robust fitting", cond_r)
 
-            # IF THERE MIGHT BE OUTLIERS
+            # robust fitting
             if cond_r:
 
-                # NOTE: initially, use all points
                 cond = np.zeros(N, dtype=bool)
 
-                # FIXME: makes no sense if this always refers to the full dataset
+                # outer-loop, outliers adjusted on each iteration
                 rrdx = 1
                 while rrdx < 10:
-                    #print("\nnew outlier loop")
-                    # currently marked outliers
                     cond_original = cond
-
-                    # outer loop determines current outliers
                     non_outlier_idx = np.where(cond == False)
 
-                    # NOTE: maybe good to estimate C again here..?
-                    # ------------------------------------------------
-                    # OR, BELOW FIT, ESTIMATE C ONLY WITH CLEAN DATA?
+                    # clean design
+                    clean_design = design_matrix[non_outlier_idx]
+                    clean_data = flat_data[vox][non_outlier_idx]
+                    clean_residuals = residuals[non_outlier_idx]
+                    clean_log_residuals = log_residuals[non_outlier_idx]
 
+                    if not(linear) and rrdx == 0:
+                        start_params = this_param
+                    if not(linear) and rrdx > 1:
+                        start_params, _ = ols_fit_tensor(clean_design,
+                                                         clean_data,
+                                                         return_lower_triangular=True)
 
-                    # NOTE: testing re-initialization for non-linear with clean data
-                    if cond.sum() > 0:
-                        start_params, _ = ols_fit_tensor(clean_design, clean_data, return_lower_triangular=True)
-
+                    # inner-loop, given current outliers, perform IRLS
                     rdx = 1
-                    while rdx <= 10:  # NOTE: capped at 10 iterations
-                        # Fit without outliers (first loop, no outliers identified)
-                        # NOTE: ensure cond still masks the full dataset
-                        clean_design = design_matrix[non_outlier_idx]
-                        clean_data = flat_data[vox][non_outlier_idx]
-                        clean_residuals = residuals[non_outlier_idx] # NOTE: get re-estimated after fit
-                        clean_log_residuals = log_residuals[non_outlier_idx]
-                        #print("clean data size:", clean_design.shape)
-
-
-                        # FIXME: why isn't this inner loop resulting in a new fit
-                        # after we have updated the outliers?
+                    while rdx <= 10:
+                        #print("outer:", rrdx, "inner:", rdx)
+                        # clean_residuals, C: updated in this loop
 
                         if not(linear):
                             gmm = C**2 / (C**2 + clean_residuals**2)**2
 
-                            # NOTE: we are still using 'start_params' from OLS (on first iter)
-                            # ------------------------------------------------
-
-                            # do we want to redo OLS using the clean data, to restart NLLS?
-
                             # Do nlls with GMM-weighting:
-                            if jac:
-                                this_param, status = opt.leastsq(nlls.err_func,
-                                                                 start_params,
-                                                                 args=(clean_design,
-                                                                       clean_data,
-                                                                       'gmm',
-                                                                       gmm),
-                                                                 Dfun=nlls.jacobian_func)
-                            else:
-                                # FIXME: change this as well
-                                this_param, status = opt.leastsq(nlls.err_func,
-                                                                 start_params,
-                                                                 args=(design_matrix,
-                                                                       flat_data[vox],
-                                                                       'gmm',
-                                                                       gmm))
+                            this_param, status = opt.leastsq(nlls.err_func,
+                                                             start_params,
+                                                             args=(clean_design,
+                                                                   clean_data,
+                                                                   'gmm',
+                                                                   gmm),
+                                                             Dfun=Dfun)
 
-                            # Recalculate residuals given gmm fit
-                            # NOTE: recalculate for FULL dataset (not just cleaned)
-                            pred_sig = np.exp(np.dot(design_matrix, this_param))
-                            residuals = flat_data[vox] - pred_sig
-                            C = factor * np.median(np.abs(residuals - np.median(residuals)))
+                            #pred_sig = np.exp(np.dot(design_matrix, this_param))
+                            #residuals = flat_data[vox] - pred_sig
+                            #C = factor * np.median(np.abs(residuals - np.median(residuals)))
+
+                            # calculate for clean data only
+                            pred_sig = np.exp(np.dot(clean_design, this_param))
+                            clean_residuals = clean_data - pred_sig
+                            C = factor * np.median(np.abs(clean_residuals - np.median(clean_residuals)))
                         
                         else:
                             gmm = (C/pred_sig)**2 / ((C/pred_sig)**2 + log_residuals**2)**2
@@ -2271,51 +2238,30 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                             C = factor * np.median(np.abs(z - np.median(z))) # NOTE: IRLS eq9 correction
 
 
-                        # check for convergence
+                        # check for convergence of the parameters
                         perc = 100 * np.linalg.norm(this_param - start_params) / np.linalg.norm(this_param)
                         start_params = this_param
-                        #print("rdx:", rdx, "perc:", perc, "C:", C)
                         if perc < 0.1: break
                         rdx = rdx + 1
 
 
-                    # detect outliers using 2-eyes test
-                    # ---------------------------------
-                    # NOTE: haven't studentize the residuals
+                    # detect outliers using MODIFIED 2-eyes test
+                    # ------------------------------------------
+                    # NOTE: haven't studentize the residuals (or linear, can maybe do for NL too)
 
-                    # predictions
                     log_pred_sig = np.dot(design_matrix, this_param)
                     pred_sig = np.exp(log_pred_sig)
-
-                    # Get the residuals
                     residuals = flat_data[vox] - pred_sig  # non-linear problem
                     log_residuals = np.log(flat_data[vox]) - log_pred_sig  # linear-problem
 
-                    # NOTE: don't redo C, we have whether NL or L fitting
-                    # in both cases it estimates stdev in non-linear space
-                    # to test log_residuals, need to convert to linear space
-    #                C_NL = factor * np.median(np.abs(residuals - np.median(residuals)))
-    #                z = pred_sig * log_residuals
-    #                C_L = factor * np.median(np.abs(z - np.median(z)))
-
-    #                print("C:", C)
-                    #cond = (residuals > 3*C) | (log_residuals < -3*C/pred_sig)
-                    #cond = (residuals < -3*C) | (log_residuals > 3*C/pred_sig)
+                    # conditions for detecting outliers
                     cond_a = (residuals > +cutoff*C) | (log_residuals < -cutoff*C/pred_sig)
                     cond_b = (log_residuals > +cutoff*C/pred_sig) | (residuals < -cutoff*C)
                     cond = cond_a | cond_b
+
                     rrdx += 1
 
-#                    print("vox:", vox, "has", cond.sum(), "outliers")
-#                    import matplotlib.pyplot as plt
-#                    #fig, ax = plt.subplots(1, 2)
-#                    #ax[0].scatter(np.zeros_like(residuals), residuals)
-#                    #ax[1].scatter(np.zeros_like(log_residuals), log_residuals)
-#                    plt.scatter(residuals, log_residuals, c=cond.astype(int))
-#                    plt.title(cond.sum())
-#                    plt.show()
-
-                    # NOT PICKING UP ANY NEW OUTLIERS
+                    # check if new outliers detected
                     if np.all(cond == cond_original):
                         #print(vox, "nothing new, breaking")
                         break
@@ -2323,60 +2269,47 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 # refit without outliers 
                 robust[vox] = (cond == False)
                 if np.any(cond) and False:  # NOTE: leaving as robust fitting for now, outliers removed
-                    #print("vox:", vox, "final fit")
 
                     # If you still have outliers, refit without those outliers:
                     non_outlier_idx = np.where(cond == False)
                     clean_design = design_matrix[non_outlier_idx]
                     clean_data = flat_data[vox][non_outlier_idx]
 
-#                    print("C:", C)
-#                    import matplotlib.pyplot as plt
-#                    #fig, ax = plt.subplots(1, 2)
-#                    #ax[0].scatter(np.zeros_like(residuals), residuals)
-#                    #ax[1].scatter(np.zeros_like(log_residuals), log_residuals)
-#                    plt.scatter(residuals, log_residuals, c=cond)
-#                    plt.title("final non-outliers")
-#                    plt.show()
-
                     if not(linear):
-
                         # recalculate OLS solution with clean data
                         new_start, _ = ols_fit_tensor(clean_design, clean_data,
-                                                   return_lower_triangular=True)
+                                                      return_lower_triangular=True)
 
-                        if jac:
-                            this_param, status = opt.leastsq(nlls.err_func,
-                                                             new_start,
-                                                             args=(clean_design,
-                                                                   clean_data,
-                                                                   None),
-                                                             Dfun=nlls.jacobian_func)
-                        else:
-                            this_param, status = opt.leastsq(nlls.err_func,
-                                                             new_start,
-                                                             args=(clean_design,
-                                                                   clean_data,
-                                                                   None))
+                        this_param, status = opt.leastsq(nlls.err_func,
+                                                         new_start,
+                                                         args=(clean_design,
+                                                               clean_data,
+                                                               None),
+                                                         Dfun=Dfun)
                     else:
                         # calculate WLS solution
-                        this_param, _ = wls_fit_tensor(clean_design, clean_data, return_lower_triangular=True)
+                        this_param, _ = wls_fit_tensor(clean_design,
+                                                       clean_data,
+                                                       return_lower_triangular=True)
 
-
-            # Convert diffusion tensor parameters to the evals and the evecs:
-            evals, evecs = decompose_tensor(
-                from_lower_triangular(this_param[:6]))
-            params[vox, :3] = evals
-            params[vox, 3:12] = evecs.ravel()
             params_7[vox, :] = this_param
             C_all[vox] = C
 
+            if adjacency is None:
+                # FIXME: we don't need to do this yet
+                # Convert diffusion tensor parameters to the evals and the evecs:
+                evals, evecs = decompose_tensor(
+                    from_lower_triangular(this_param[:6]))
+                params[vox, :3] = evals
+                params[vox, 3:12] = evecs.ravel()
+
+
+        # FIXME: not sure where to put this
         # If leastsq failed to converge and produced nans, we'll resort to the
         # OLS solution in this voxel:
-        #except (np.linalg.LinAlgError, TypeError) as e:
-        except (np.linalg.LinAlgError) as e:
-            resort_to_OLS = True  # FIXME: would be WLS if linear==True
-            this_param = start_params
+        except (np.linalg.LinAlgError, TypeError) as e:
+            resort_to_OLS = True
+            this_param = start_params  # FIXME: this gets updated in loops above
 
             if not fail_is_nan:
                 # Convert diffusion tensor parameters to evals and evecs:
@@ -2402,65 +2335,46 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
     if adjacency is not None:
         CORR = np.empty(flat_data.shape[1])
         for vox in range(flat_data.shape[0]):
+            #print("imp loop, vox:", vox)
+            CC = C_all[adjacency[vox]]
             LOGP = np.dot(design_matrix, params_7[adjacency[vox]].T)
             PRED = np.exp(LOGP)
             Y = flat_data[adjacency[vox]].T
             LOGY = np.log(Y)
 
-#            # Laplacian Eigenmap just on Y
-#            DIST = squareform(pdist(Y))
-#            DIST = cdist(Y, PRED)
-#            KERN = np.exp(-DIST**2/100)
-#            #plt.imshow(KERN)
-#            #plt.show()
-#
-#            D = np.diag(KERN.sum(axis = 0))
-#            L = D - KERN
-#            Q, V = eigh(L, b=D, subset_by_index=[N-2, N-1])
-#            print(Q.shape, V.shape)
-#            plt.scatter(V[:,0], V[:,1], c = GOOD)
-#            plt.show()
-#
-#            print(L)
-
-#            print(PRED.shape, Y.shape)
-            # loop over images
-#            for img in range(flat_data.shape[1]):
-#                #CORR[img] = np.corrcoef(PRED[img], Y[img])[0, 1]
-#                CORR[img] = np.sum((PRED[img] - Y[img])**2)
-#                #CORR[img] = np.sum((LOGP[img] - LOGY[img])**2)
-#                #CORR[img] = np.abs(np.sum((PRED[img] - Y[img])))
-#                #CORR[img] = (np.sum(np.abs(PRED[img] - Y[img])))
-
-
-            #CORR = np.sum((PRED - Y)**2, axis = 1)
-            CC = C_all[adjacency[vox]]
-            print("C in patch:", CC)
-            inv_V = np.diagonal(1.0 / CC**2)
+            # calculate implausibility
             yy = (PRED - Y)
-            CORR = yy.T.dot(inv_V).dot(yy)
-            #CORR = np.sum((PRED - Y), axis = 1)
+            ivar = np.diag(1.0/CC**2)
+            CORR = np.einsum('ij,ji->i', (yy).dot(ivar), yy.T)
             MED = np.median(CORR)
             MAD = np.median(np.abs(CORR - MED))
-            
+            CUT = chi2.ppf(0.997, df=len(CC))
 
-            if True:
+            if False:
+                print("C in patch:", CC)
+                print("C in vox:", C_all[vox])
+
                 print(robust[vox])
-                order = np.argsort(CORR)
                 print(GOOD)
-                fig, ax = plt.subplots(1,2)
+                order = np.argsort(CORR)
+                RES = flat_data[vox] - np.exp(np.dot(design_matrix, params_7[vox].T))
+                fig, ax = plt.subplots(1,3)
                 ax[0].scatter(np.arange(flat_data.shape[1]), CORR[order], c = GOOD[order])
                 ax[0].axhline(MED, ls="-")
                 ax[0].axhline(MED + 3*MAD, ls="--")
                 ax[0].axhline(MED - 3*MAD, ls="--")
+                ax[0].axhline(CUT, ls="--", color="red")
                 ax[1].scatter(np.arange(flat_data.shape[1]), CORR[order], c = robust[vox][order])
                 ax[1].axhline(MED, ls="-")
                 ax[1].axhline(MED + 3*MAD, ls="--")
                 ax[1].axhline(MED - 3*MAD, ls="--")
+                ax[1].axhline(CUT, ls="--", color="red")
+                ax[2].scatter(np.arange(flat_data.shape[1]), RES[order], c = robust[vox][order])
                 plt.show()
 
             # update robust
-            MV_cond = (CORR > (MED + 3*MAD)) | (CORR < (MED - 3*MAD))
+            #MV_cond = (CORR > (MED + 3*MAD)) | (CORR < (MED - 3*MAD))
+            MV_cond = (CORR > CUT)
             robust[vox, MV_cond] = 0
 
             # fit signal
@@ -2474,19 +2388,12 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 new_start, _ = ols_fit_tensor(clean_design, clean_data,
                                            return_lower_triangular=True)
 
-                if jac:
-                    this_param, status = opt.leastsq(nlls.err_func,
-                                                     new_start,
-                                                     args=(clean_design,
-                                                           clean_data,
-                                                           None),
-                                                     Dfun=nlls.jacobian_func)
-                else:
-                    this_param, status = opt.leastsq(nlls.err_func,
-                                                     new_start,
-                                                     args=(clean_design,
-                                                           clean_data,
-                                                           None))
+                this_param, status = opt.leastsq(nlls.err_func,
+                                                 new_start,
+                                                 args=(clean_design,
+                                                       clean_data,
+                                                       None),
+                                                 Dfun=Dfun)
             else:
                 # calculate WLS solution
                 this_param, _ = wls_fit_tensor(clean_design, clean_data, return_lower_triangular=True)
@@ -2497,6 +2404,12 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
             params[vox, :3] = evals
             params[vox, 3:12] = evecs.ravel()
             params_7[vox, :] = this_param
+
+            if return_S0_hat:
+                model_S0[vox] = np.exp(-this_param[-1])
+            if not dti:
+                md2 = evals.mean(0) ** 2
+                params[vox, 12:] = this_param[6:-1] / md2
 
     if resort_to_OLS:
         warnings.warn("Resorted to OLS solution in some voxels", UserWarning)
