@@ -2081,7 +2081,7 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                       linear=False,
                       cutoff=3,
                       adjacency=None,
-                      GOOD=None):
+                      GOOD=None): # FIXME: remove GOOD, is only here to help development
     """
     TODO: add this later.
     """
@@ -2187,6 +2187,7 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                     clean_residuals = residuals[non_outlier_idx]
                     clean_log_residuals = log_residuals[non_outlier_idx]
 
+                    # only need to recalculate OLS fit for non-linear fitting
                     if not(linear) and rrdx == 0:
                         start_params = this_param
                     if not(linear) and rrdx > 1:
@@ -2224,9 +2225,8 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                         else:
                             gmm = (C/pred_sig)**2 / ((C/pred_sig)**2 + log_residuals**2)**2
 
-                            # TODO: refit here (recalc 'this_param'), linear fit with gmm weights
-                            # FIXME: WARNING, HAVE NOT UPDATED this_param HERE!!!!
-                            fit_result = np.einsum('...ij,...j',
+                            # FIXME: I have now updated "this_param" here, need to ensure its correct
+                            this_param = np.einsum('...ij,...j',
                                                    np.linalg.pinv(design_matrix * gmm[..., None]),
                                                    gmm * np.log(flat_data[vox]))
 
@@ -2247,7 +2247,7 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
                     # detect outliers using MODIFIED 2-eyes test
                     # ------------------------------------------
-                    # NOTE: haven't studentize the residuals (or linear, can maybe do for NL too)
+                    # FIXME: haven't studentize the residuals (for linear, can maybe do for NL too, using design matrix?)
 
                     log_pred_sig = np.dot(design_matrix, this_param)
                     pred_sig = np.exp(log_pred_sig)
@@ -2268,7 +2268,7 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
                 # refit without outliers 
                 robust[vox] = (cond == False)
-                if np.any(cond) and False:  # NOTE: leaving as robust fitting for now, outliers removed
+                if np.any(cond): # and False:  # NOTE: leaving as robust fitting for now, outliers removed
 
                     # If you still have outliers, refit without those outliers:
                     non_outlier_idx = np.where(cond == False)
