@@ -2123,6 +2123,8 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
     nlls = _nlls_class()
     Dfun = nlls.jacobian_func if jac else None
 
+    # TODO: place multivariate outlier check before doing any robust fitting... would need to estimate C first
+
     if return_S0_hat:
         model_S0 = np.empty((flat_data.shape[0], 1))
     for vox in range(flat_data.shape[0]):
@@ -2236,8 +2238,9 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 # refit without outliers, without GMM weights
                 # -------------------------------------------
                 robust[vox] = (cond == False)
+                # FIXME: print("if adoing adjacency, surely we should still refit without outliers first? Hmmm... we record robust, but don't refit before adj checks...")
                 #if np.any(cond):  # NOTE: leaving as robust fitting for now, outliers removed
-                if True:  # NOTE: MUST redo! Because others 'this_param' left as GMM result! 
+                if adjacency is None:  # NOTE: MUST redo! Because others 'this_param' left as GMM result! 
 
                     # If you still have outliers, refit without those outliers:
                     non_outlier_idx = np.where(cond == False)
@@ -2290,7 +2293,8 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
         # OLS solution in this voxel:
         except (np.linalg.LinAlgError, TypeError) as e:
             resort_to_OLS = True
-            this_param = start_params  # FIXME: this gets updated in loops above, if we fail, we should really return to initial fit, not GMM fit which may fail
+            #this_param = start_params  # FIXME: this gets updated in loops above, if we fail, we should really return to initial fit, not GMM fit which may fail
+            this_param = ols_params[vox]
 
             if not fail_is_nan:
                 # Convert diffusion tensor parameters to evals and evecs:
@@ -2312,7 +2316,6 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
     # code to check spatial patch for correlations, improve 'robust', refit
     if adjacency is not None:
-        print("should not do this")
         CORR = np.empty(flat_data.shape[1])
         for vox in range(flat_data.shape[0]):
 
@@ -2322,52 +2325,85 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
             Y = flat_data[adjacency[vox]].T
             LOGY = np.log(Y)
 
+            # FIXME: whoops! I had normalized the residuals, but then used VAR as if I hadn't
             if not(linear):
-                yy = (PRED - Y) / CC
-                CORR = (yy**2).sum(axis=1)
-                MED = np.median(CORR)
-                MAD = np.median(np.abs(CORR - MED))
+                yy = (Y - PRED) #/ CC
+                #MSE = (yy**2).sum(axis=1)
+                MSE = (yy).sum(axis=1)
+                VAR = (CC**2).sum()
+                #VAR = len(CC)*np.median(CC)**2
+                MED = np.median(MSE)
+                MAD = np.median(np.abs(MSE - MED))
+                # FIXME: replacing VAR for now
+                #VAR = (1.4826 * MAD)**2
             else:
-                yy = (LOGP - LOGY) * PRED / CC   # NOTE: I think this is right...
-                CORR = (yy**2).sum(axis=1)
-                MED = np.median(CORR)
-                MAD = np.median(np.abs(CORR - MED))
+                yy = (LOGY - LOGP) * PRED #/ CC   # NOTE: I think this is right...
+                #MSE = (yy**2).sum(axis=1)
+                MSE = (yy).sum(axis=1)
+                VAR = (CC**2).sum()
+                #print("var 1:", VAR)
+                #VAR = len(CC)*np.median(CC)**2
+                #print("var 2:", VAR)
+                MED = np.median(MSE)
+                MAD = np.median(np.abs(MSE - MED))
+                # FIXME: replacing VAR for now
+                #VAR = (1.4826 * MAD)**2
 
+            # FIXME: it may be too harsh to use the theoertically correct test, MED and MAD is less harsh, but may miss things 
             MAD = MAD * 1.4826
-            MV_cond = (CORR > (MED + 3*MAD)) | (CORR < (MED - 3*MAD))
+            #MV_cond = (MSE > (MED + 3*MAD)) | (MSE < (MED - 3*MAD))
+            #MV_cond = (MSE > (+3*MAD)) | (MSE < (-3*MAD))
+            MV_cond = (MSE > +3*np.sqrt(VAR)) | (MSE < -3*np.sqrt(VAR))
+            # update robust, 
+            robust[vox, MV_cond] = 0
 
+            # plotting to check results
             if True:
                 print("C in patch:", CC)
                 print("C in vox:", C_all[vox])
+                from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-                BAD = 1 - GOOD
+                try:
+                    BAD = 1 - GOOD
+                except:
+                    BAD = np.zeros(flat_data.shape[-1])
 
                 print(robust[vox])
                 print("good:", BAD)
-                order = np.argsort(CORR)
+                order = np.argsort(MSE)
                 RES = flat_data[vox] - np.exp(np.dot(design_matrix, params_7[vox].T))
                 fig, ax = plt.subplots(3, 1)
-                ax[0].scatter(np.arange(flat_data.shape[1]), CORR[order], c = BAD[order], cmap="RdYlGn")
+                ax[0].scatter(np.arange(flat_data.shape[1]), MSE[order], c = BAD[order], cmap="RdYlGn")
                 ax[0].set_title("metric value, red if corrupt")
                 ax[0].axhline(MED, ls="-")
-                ax[0].axhline(MED + 3*MAD, ls="--")
-                ax[0].axhline(MED - 3*MAD, ls="--")
-                ax[1].scatter(np.arange(flat_data.shape[1]), CORR[order], c = robust[vox][order], vmin=0, vmax=1)
+                ax[0].axhline(MED + 3*MAD, ls=":")
+                ax[0].axhline(MED - 3*MAD, ls=":")
+                ax[0].axhline(+3*np.sqrt(VAR), ls="--")
+                ax[0].axhline(-3*np.sqrt(VAR), ls="--")
+                ax[1].scatter(np.arange(flat_data.shape[1]), MSE[order], c = robust[vox][order], vmin=0, vmax=1)
+                #im1 = ax[1].scatter(np.arange(flat_data.shape[1]), MSE[order], c = np.sqrt(GMM[vox][order]/GMM[vox].sum()))
+                #divider = make_axes_locatable(ax[1])
+                #cax = divider.append_axes('right', size='5%', pad=0.05)
+                #fig.colorbar(im1, cax=cax, orientation='vertical')
                 ax[1].set_title("metric value, color by if robust test (yellow=1)")
                 ax[1].axhline(MED, ls="-")
-                ax[1].axhline(MED + 3*MAD, ls="--")
-                ax[1].axhline(MED - 3*MAD, ls="--")
+                ax[1].axhline(MED + 3*MAD, ls=":")
+                ax[1].axhline(MED - 3*MAD, ls=":")
+                ax[1].axhline(+3*np.sqrt(VAR), ls="--")
+                ax[1].axhline(-3*np.sqrt(VAR), ls="--")
                 ax[2].scatter(np.arange(flat_data.shape[1]), RES[order], c = robust[vox][order])
+                ax[2].axhline(+3*np.mean(CC), ls="--")
+                ax[2].axhline(-3*np.mean(CC), ls="--")
+                ax[2].scatter(np.arange(flat_data.shape[1]), RES[order], c = BAD[order])
                 ax[2].set_title("residual values, color by if robust (yellow=1)")
 
-                vline = np.argmin(np.abs(CORR[order] - (MED + 3*MAD)))
-                for pdx in range(3):
+                vline = np.argmin(np.abs(MSE[order] - (MED + 3*MAD)))
+                for pdx in range(2):
                     ax[pdx].axvline(vline)
-                    ax[pdx].axhline(len(CC), ls = ":", color="orange")
+          #          ax[pdx].axhline(k, ls = ":", color="orange")
+          #          ax[pdx].axhline(k + 3*np.sqrt(2*k), ls = ":", color="pink")
                 plt.show()
 
-            # update robust
-            robust[vox, MV_cond] = 0
 
             # fit signal
             non_outlier_idx = np.where(robust[vox] == 1)
@@ -2395,7 +2431,9 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 from_lower_triangular(this_param[:6]))
             params[vox, :3] = evals
             params[vox, 3:12] = evecs.ravel()
-            params_7[vox, :] = this_param
+
+            # NOTE: we cannot do this as we go along, because it's used in the adjacency loop!
+            #params_7[vox, :] = this_param
 
             if return_S0_hat:
                 model_S0[vox] = np.exp(-this_param[-1])
@@ -2554,7 +2592,8 @@ def robustadj_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 #VAR = (1.4826 * MAD)**2
 
             #print(np.sqrt(VAR), np.mean(CC))
-            GMM[vox] = VAR / (VAR + MSE**2)**2
+            GMM[vox] = VAR / (VAR + MSE**2)**2  # gm
+            #GMM[vox] = VAR / (VAR + MSE**2)  # cauchy
 
 
         # robust fitting using GMM weighting
@@ -2607,9 +2646,10 @@ def robustadj_fit_tensor(design_matrix, data, sigma=None, jac=True,
     # 3) refit without outliers, without GMM weights
     # ----------------------------------------------
     if True: # NOTE: let's just leave the results as the GMM fit for now...
+        print("warning! This if statement allows plotting, but currently undoes the GMM work")
         for vox in range(flat_data.shape[0]):
-            print(adjacency[vox])
-            print(CC)
+            #print(adjacency[vox])
+            #print(CC)
 
             CC = C_all[adjacency[vox]]
             LOGP = np.dot(design_matrix, params_7[adjacency[vox]].T)
@@ -2623,6 +2663,7 @@ def robustadj_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 #MSE = (yy**2).sum(axis=1)
                 MSE = (yy).sum(axis=1)
                 VAR = (CC**2).sum()
+                #VAR = len(CC)*np.median(CC)**2
                 MED = np.median(MSE)
                 MAD = np.median(np.abs(MSE - MED))
                 # FIXME: replacing VAR for now
@@ -2632,12 +2673,19 @@ def robustadj_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 #MSE = (yy**2).sum(axis=1)
                 MSE = (yy).sum(axis=1)
                 VAR = (CC**2).sum()
+                #print("var 1:", VAR)
+                #VAR = len(CC)*np.median(CC)**2
+                #print("var 2:", VAR)
                 MED = np.median(MSE)
                 MAD = np.median(np.abs(MSE - MED))
                 # FIXME: replacing VAR for now
                 #VAR = (1.4826 * MAD)**2
 
-            GMM[vox] = VAR / (VAR + MSE**2)**2
+            GMM[vox] = VAR / (VAR + MSE**2)**2  # gm
+            #GMM[vox] = VAR / (VAR + MSE**2)  # cauchy
+
+            # TODO: the obvious solution is to discard the outliers, then refit without weighting
+            #       but we could just use this solution in the original robustadj function?
 
             # if VAR really is the variance of the sum of 
             # replace these values for plotting
@@ -2647,7 +2695,7 @@ def robustadj_fit_tensor(design_matrix, data, sigma=None, jac=True,
             # FIXME: what is condition for being robust?
             cond = GMM[vox] < 0
     
-            print(GMM[vox])
+            #print(GMM[vox])
             robust[vox] = (cond == False)
 
             # plotting to check results
@@ -2656,7 +2704,10 @@ def robustadj_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 print("C in vox:", C_all[vox])
                 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-                BAD = 1 - GOOD
+                try:
+                    BAD = 1 - GOOD
+                except:
+                    BAD = np.zeros(flat_data.shape[-1])
 
                 print(robust[vox])
                 print("good:", BAD)
@@ -2666,14 +2717,18 @@ def robustadj_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 ax[0].scatter(np.arange(flat_data.shape[1]), MSE[order], c = BAD[order], cmap="RdYlGn")
                 ax[0].set_title("metric value, red if corrupt")
                 ax[0].axhline(MED, ls="-")
-                ax[0].axhline(MED + 3*MAD, ls="--")
-                ax[0].axhline(MED - 3*MAD, ls="--")
+                ax[0].axhline(MED + 3*MAD, ls=":")
+                ax[0].axhline(MED - 3*MAD, ls=":")
+                ax[0].axhline(+3*np.sqrt(VAR), ls="--")
+                ax[0].axhline(-3*np.sqrt(VAR), ls="--")
                 #ax[1].scatter(np.arange(flat_data.shape[1]), MSE[order], c = robust[vox][order], vmin=0, vmax=1)
                 im1 = ax[1].scatter(np.arange(flat_data.shape[1]), MSE[order], c = np.sqrt(GMM[vox][order]/GMM[vox].sum()))
                 ax[1].set_title("metric value, color by if robust test (yellow=1)")
                 ax[1].axhline(MED, ls="-")
-                ax[1].axhline(MED + 3*MAD, ls="--")
-                ax[1].axhline(MED - 3*MAD, ls="--")
+                ax[1].axhline(MED + 3*MAD, ls=":")
+                ax[1].axhline(MED - 3*MAD, ls=":")
+                ax[1].axhline(+3*np.sqrt(VAR), ls="--")
+                ax[1].axhline(-3*np.sqrt(VAR), ls="--")
                 divider = make_axes_locatable(ax[1])
                 cax = divider.append_axes('right', size='5%', pad=0.05)
                 fig.colorbar(im1, cax=cax, orientation='vertical')
