@@ -1378,7 +1378,7 @@ def iter_fit_tensor(step=1e4):
 
 @iter_fit_tensor()
 def wls_fit_tensor(design_matrix, data, return_S0_hat=False,
-                   return_lower_triangular=False):
+                   return_lower_triangular=False, return_leverages=False):
     r"""
     Computes weighted least squares (WLS) fit to calculate self-diffusion
     tensor using a linear regression model [1]_.
@@ -1452,29 +1452,51 @@ def wls_fit_tensor(design_matrix, data, return_S0_hat=False,
 
     # the weighted problem design_matrix * w is much larger (differs per voxel)
     if Version(np.__version__) < Version('1.14'):
-        fit_result = np.einsum('...ij,...j',
-                               pinv(design_matrix * w[..., None]),
-                               w * log_s)
+        if return_leverages == False:
+            fit_result = np.einsum('...ij,...j',
+                                   pinv(design_matrix * w[..., None]),
+                                   w * log_s)
+            leverages = None  # FIXME: need to calculate the leverages here too
+        else:
+            tmp = np.einsum('...ij,...j->...ij', pinv(design_matrix * w[..., None]), w)  # NOTE: weight on end here 
+            #print("tmp:", tmp.shape)
+            #tmp = np.linalg.pinv(design_matrix * w[..., None]) * w  # NOTE: weight on end here 
+            fit_result = np.einsum('...ij,...j', tmp, log_s)
+            #print("fit results:", fit_result.shape)
+            #print("des mat:", design_matrix.shape)
+            leverages = np.einsum('ij,...ji->...i', design_matrix, tmp)
+            #print(leverages.sum(axis=1))  # add up to 7, seem fine
     else:
-        fit_result = np.einsum('...ij,...j',
-                               np.linalg.pinv(design_matrix * w[..., None]),
-                               w * log_s)
+        if return_leverages == False:
+            fit_result = np.einsum('...ij,...j',
+                                   np.linalg.pinv(design_matrix * w[..., None]),
+                                   w * log_s)
+            leverages = None
+        else:
+            tmp = np.einsum('...ij,...j->...ij', np.linalg.pinv(design_matrix * w[..., None]), w)  # NOTE: weight on end here 
+            #print("tmp:", tmp.shape)
+            #tmp = np.linalg.pinv(design_matrix * w[..., None]) * w  # NOTE: weight on end here 
+            fit_result = np.einsum('...ij,...j', tmp, log_s)
+            #print("fit results:", fit_result.shape)
+            #print("des mat:", design_matrix.shape)
+            leverages = np.einsum('ij,...ji->...i', design_matrix, tmp)
+            #print(leverages.sum(axis=1))  # add up to 7, seem fine
 
     if return_lower_triangular:
-        return fit_result, None
+        return fit_result, leverages
 
     if return_S0_hat:
         return (eig_from_lo_tri(fit_result,
                                 min_diffusivity=tol / -design_matrix.min()),
-                np.exp(-fit_result[:, -1])), None
+                np.exp(-fit_result[:, -1])), leverages
     else:
         return eig_from_lo_tri(fit_result,
-                               min_diffusivity=tol / -design_matrix.min()), None
+                               min_diffusivity=tol / -design_matrix.min()), leverages
 
 
 @iter_fit_tensor()
 def ols_fit_tensor(design_matrix, data, return_S0_hat=False,
-                   return_lower_triangular=False):
+                   return_lower_triangular=False, return_leverages=False):
     r"""
     Computes ordinary least squares (OLS) fit to calculate self-diffusion
     tensor using a linear regression model [1]_.
@@ -1523,19 +1545,25 @@ def ols_fit_tensor(design_matrix, data, return_S0_hat=False,
     """
     tol = 1e-6
     data = np.asarray(data)
-    fit_result = np.einsum('...ij,...j', np.linalg.pinv(design_matrix),
-                           np.log(data))
+    if return_leverages == False:
+        fit_result = np.einsum('...ij,...j', np.linalg.pinv(design_matrix),
+                               np.log(data))
+        leverages = None
+    else:
+        tmp = np.linalg.pinv(design_matrix)
+        fit_result = np.einsum('...ij,...j', tmp, np.log(data))
+        leverages = np.einsum('ij,ji->i', design_matrix, tmp)
 
     if return_lower_triangular:
-        return fit_result, None
+        return fit_result, leverages
 
     if return_S0_hat:
         return (eig_from_lo_tri(fit_result,
                                 min_diffusivity=tol / -design_matrix.min()),
-                np.exp(-fit_result[:, -1])), None
+                np.exp(-fit_result[:, -1])), leverages
     else:
         return eig_from_lo_tri(fit_result,
-                               min_diffusivity=tol / -design_matrix.min()), None
+                               min_diffusivity=tol / -design_matrix.min()), leverages
 
 
 def _ols_fit_matrix(design_matrix):
@@ -2082,6 +2110,7 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                       cutoff=3,
                       adjacency=None,
                       always_gmm=False,
+                      use_gmm=True, # NOTE: this should turn off initial robust weighting
                       patch_outliers=True,
                       patch_iter=10,
                       GOOD=None): # FIXME: remove GOOD, is only here to help development # NOTE: GOOD is actually indices of bad points
@@ -2104,13 +2133,16 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
     # Flatten for the iteration over voxels:
     flat_data = data.reshape((-1, N))
     log_flat_data = np.log(flat_data)
+    leverages = np.empty_like(flat_data)
 
     if not(linear):
         # calculate OLS solution
-        D, _ = ols_fit_tensor(design_matrix, flat_data, return_lower_triangular=True)
+        #D, _ = ols_fit_tensor(design_matrix, flat_data, return_lower_triangular=True)
+        D, leverages[:] = ols_fit_tensor(design_matrix, flat_data, return_lower_triangular=True, return_leverages=True)
     else:
         # calculate WLS solution
-        D, _ = wls_fit_tensor(design_matrix, flat_data, return_lower_triangular=True)
+        #D, _ = wls_fit_tensor(design_matrix, flat_data, return_lower_triangular=True)
+        D, leverages = wls_fit_tensor(design_matrix, flat_data, return_lower_triangular=True, return_leverages=True)
 
     # Flatten for the iteration over voxels:
     ols_params = np.reshape(D, (-1, D.shape[-1]))
@@ -2178,7 +2210,7 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
             # robust fitting using GMM weighting
             # ----------------------------------
-            if cond_r or always_gmm:
+            if (cond_r or always_gmm) and use_gmm:
 
                 # start with non-robust estimate
                 start_params = this_param
@@ -2244,6 +2276,8 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 residuals = flat_data[vox] - pred_sig
                 log_residuals = log_flat_data[vox] - log_pred_sig
 
+                # NOTE: I am not convinced about leverages for NL residuals, may want to calculate for WLS in both cases, translate through to sigma for NL case
+
                 # studentize residuals
                 if not(linear): w = np.sqrt(gmm_l)
                 HAT = np.dot(design_matrix, (np.linalg.pinv(design_matrix * w[..., None]) * w[..., None].T))
@@ -2259,10 +2293,11 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 cond = cond_a | cond_b
 
 
+                # NOTE: if we don't do this, the parameters don't get saved from GMM at all, so no point
                 # refit without outliers, without GMM weights
                 # -------------------------------------------
                 robust[vox] = (cond == False)
-                if np.any(cond):
+                if np.any(cond) and patch_iter == 0:  # NOTE: only doing this 'clean fit' if not doing patch
 
                     # If you still have outliers, refit without those outliers:
                     non_outlier_idx = np.where(cond == False)
@@ -2319,7 +2354,7 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                     from_lower_triangular(this_param[:6]))
                 params[vox, :3] = evals
                 params[vox, 3:12] = evecs.ravel()
-            else:
+            else:  # FIXME: can't really have this case if doing reweighting below
                 # Set NaN values
                 params[vox, :] = np.nan
 
@@ -2329,10 +2364,12 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
             md2 = evals.mean(0) ** 2
             params[vox, 12:] = params_flat[vox, 6:-1] / md2
 
+
     # code to check spatial patch for correlations, improve 'robust', refit
     # ---------------------------------------------------------------------
     params_flat_backup = params_flat.copy()
-    if adjacency is not None:
+    #if adjacency is not None:
+    if patch_iter > 0:
 
         params_flat_2 = np.empty_like(params_flat)  # NOTE: use this to store updated params_flat, so we can loop this process and see what happens
 
@@ -2344,89 +2381,233 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
             LOGP_all = np.dot(design_matrix, params_flat.T).T
             PRED_all = np.exp(LOGP_all)
 
-            # OLS HAT matrix, same for all voxels
-            HAT = np.dot(design_matrix, np.linalg.pinv(design_matrix))
-            HAT_factor = np.sqrt(1 - np.diag(HAT))
+            # will be calculated from initial OLS/WLS fit, and after each 1/RMSE reweighting
+            HAT_factor_all = np.sqrt(1 - leverages)
 
-            CORR = np.empty(flat_data.shape[1])
+            # FIXME: OLS HAT matrix, same for all voxels, for convenience
+            #HAT = np.dot(design_matrix, np.linalg.pinv(design_matrix))
+            #print("original HAT shape:", HAT.shape)
+
+            # NOTE: this is the H-factor the log-problem... how exactly can we translate that into the non-linear problem???
+
+            # calculate HAT matrix for each WLS solution, to see if the factors help sort stuff out
+#            for vox in range(flat_data.shape[0]):
+#
+#                # FIXME: problem! the leverages for the cleaned-up problem are different! Hence why it affects the solution when using Robust Fitting
+#                # this suggests there is a problem with using GMM prior to this approach, at least when the noise is low
+#                non_outlier_idx = np.where(robust[vox] == 1)
+#                clean_design = design_matrix[non_outlier_idx]
+#                w = PRED_all[vox][non_outlier_idx]
+#                HAT = np.dot(clean_design, (np.linalg.pinv(clean_design * w[..., None]) * w[..., None].T))
+#                #HAT_factor_all[vox][non_outlier_idx] = np.sqrt(1 - np.diag(HAT)) * w  # NOTE: my attempt to translate the studentization to the NL sigma
+#                HAT_factor_all[vox][non_outlier_idx] = np.sqrt(1 - np.diag(HAT))
+#                #print(HAT_factor_all[vox])
+
+            # FIXME: it MUST be related to the exp(log_pred) issue - the HAT matrix is for linear problem
+            #        eq 13 and 14 suggest that we can adjust be this HAT matrix in both cases, but I have doubts now about NL case
+            #        we do not know the leverages for the non-linear problem!
+            #        it may be the WLS fitting tends to have this effect, maybe due to the weighting?
+
+            #plt.scatter(PRED_all[0], HAT_factor_all[0])
+            #plt.show()
+
+            # if using all voxels, only need a single RMSE calculation
+            if adjacency is None:
+                LOGP = LOGP_all
+                PRED = PRED_all
+                LOGY = log_flat_data
+                Y = flat_data
+                HAT_factor = HAT_factor_all
+
+                # calculate RMSE = sigma, for 1/sigma^2 weighting of residuals^2 - sigma is error stdev in *non-linear* space
+                yy = (Y - PRED) / HAT_factor  # NOTE: have attempted to studentize
+                MSE = (yy**2).mean(axis=0)
+                #MSE = np.median(yy**2, axis=0)
+                RMSE = np.sqrt(MSE)
+#                print("adx:", adx)
+#                print(RMSE)
+
+                # for figuring out issues with MV_outlier!
+                # ----------------------------------------
+                MED = np.median(RMSE)
+                MAD = np.median(np.abs(RMSE - MED))
+                MAD = MAD * 1.4826
+                if False and adx == patch_iter - 1:
+
+                    try:
+                        BAD = 1 - GOOD
+                    except:
+                        BAD = np.zeros(flat_data.shape[-1])
+
+                    #print(robust[vox])
+                    #print("good:", BAD)
+                    order = np.argsort(RMSE)
+                    RES = flat_data[vox] - np.exp(np.dot(design_matrix, params_flat[vox].T))
+                    fig, ax = plt.subplots(4, 1)
+                    plt.suptitle("adx: " + str(adx))
+                    #ax[0].scatter(np.arange(flat_data.shape[1]), ME[order], c = BAD[order], cmap="RdYlGn")
+                    ax[0].scatter(np.arange(flat_data.shape[1]), RMSE[order], c = BAD[order], cmap="RdYlGn")
+                    ax[0].set_title("metric value, red if corrupt")
+                    ax[0].axhline(MED, ls="-")
+                    ax[0].axhline(C, ls="-", c="red")
+                    ax[0].axhline(MED + 3*MAD, ls=":")
+                    ax[0].axhline(MED - 3*MAD, ls=":")
+                    #ax[1].scatter(np.arange(flat_data.shape[1]), ME[order], c = robust[vox][order], vmin=0, vmax=1)
+                    ax[1].scatter(np.arange(flat_data.shape[1]), RMSE[order], c = robust[vox][order], vmin=0, vmax=1)
+                    ax[1].set_title("metric value, color by if robust test (yellow=1)")
+                    ax[1].axhline(MED, ls="-")
+                    ax[1].axhline(C, ls="-", c="red")
+                    ax[1].axhline(MED + 3*MAD, ls=":")
+                    ax[1].axhline(MED - 3*MAD, ls=":")
+
+                    ax[2].scatter(np.arange(flat_data.shape[1]), 1/RMSE[order], c = PRED.mean(axis=0)[order])
+                    ax[3].scatter(np.arange(flat_data.shape[1]), RES[order], c = PRED.mean(axis=0)[order])
+                    ax[3].set_title("residual values, color by if robust (yellow=1)")
+                    plt.show()
+
+                # FIXME: test to see if we can fix something, probably won't work
+#                med_RMSE = np.median(RMSE)
+#                RMSE[RMSE < med_RMSE] = med_RMSE
+
+#                # calculate C again, replace RMSE that MIGHT be too small (by coincidence)
+#                # NOTE: could calculate this per voxel by using axis=1 ?
+#                print(np.median(yy, axis=0).shape)
+#                print(yy.shape)
+#                C = factor * np.median(np.abs(yy - np.median(yy, axis=0)))
+#                #print(RMSE.shape, C.shape)
+#                print(C)
+#                #RMSE[RMSE < C] = C
+
             for vox in range(flat_data.shape[0]):
 
                 try:
 
-                    LOGP = LOGP_all[adjacency[vox]]
-                    PRED = PRED_all[adjacency[vox]]
-                    LOGY = log_flat_data[adjacency[vox]]
-                    Y = flat_data[adjacency[vox]]
+                    # if using local patch / neighborhood, each voxel requires new RMSE calculation
+                    if adjacency is not None:
+                        LOGP = LOGP_all[adjacency[vox]]
+                        PRED = PRED_all[adjacency[vox]]
+                        LOGY = log_flat_data[adjacency[vox]]
+                        Y = flat_data[adjacency[vox]]
+                        HAT_factor = HAT_factor_all[adjacency[vox]]
 
-                    # calculate RMSE = sigma, for 1/sigma^2 weighting of residuals^2 - sigma is error stdev in *non-linear* space
-                    yy = (Y - PRED) / HAT_factor  # NOTE: have attempted to studentize
-                    MSE = (yy**2).mean(axis=0)
-                    RMSE = np.sqrt(MSE)
+                        # calculate RMSE = sigma, for 1/sigma^2 weighting of residuals^2 - sigma is error stdev in *non-linear* space
+                        yy = (Y - PRED) / HAT_factor  # NOTE: have attempted to studentize
+                        MSE = (yy**2).mean(axis=0)
+                        #MSE = np.median(yy**2, axis=0)
+                        RMSE = np.sqrt(MSE)
 
-                    if patch_outliers:
+                        # FIXME: test to see if we can fix something, probably won't work
+#                        med_RMSE = np.median(RMSE)
+#                        RMSE[RMSE < med_RMSE] = med_RMSE
 
-                        if linear:
-                            yy = (LOGY - LOGP) * PRED
+#                        # calculate C again, replace RMSE that MIGHT be too small (by coincidence)
+#                        # NOTE: could maybe just do C across all voxels, not sure
+#                        print(np.median(yy, axis=0).shape)
+#                        print(yy.shape)
+#                        C = factor * np.median(np.abs(yy - np.median(yy, axis=0)))
+#                        #print(RMSE.shape, C.shape)
+#                        print(C)
+#                        #RMSE[RMSE < C] = C
 
-                        ME = (yy).mean(axis=0)
-                        MED = np.median(ME)
-                        MAD = np.median(np.abs(ME - MED))
+                    #if False:
+                    if patch_outliers and adx == patch_iter - 1:  # NOTE: new addition, only remove outliers on last pass
+
+                        #if linear:
+                        #    yy = (LOGY - LOGP) * PRED
+
+                        #ME = (yy).mean(axis=0)
+                        #MED = np.median(ME)
+                        #MAD = np.median(np.abs(ME - MED))
+                        #MAD = MAD * 1.4826
+                        #MV_cond = (ME > (MED + 3*MAD)) | (ME < (MED - 3*MAD))  # NOTE: if it should be zero centered, do we need 'MED' ? 
+
+                        MED = np.median(RMSE)
+                        MAD = np.median(np.abs(RMSE - MED))
                         MAD = MAD * 1.4826
+                        MV_cutoff = 3
+                        MV_cond = (RMSE > (MED + MV_cutoff*MAD)) | (RMSE < (MED - MV_cutoff*MAD))
 
-                        MV_cond = (ME > (MED + 3*MAD)) | (ME < (MED - 3*MAD))  # NOTE: if it should be zero centered, do we need 'MED' ? 
                         robust[vox, MV_cond] = 0
 
                         # FIXME: plotting to check results, remove once GOOD is removed
-                        if False:
+                        if False and adx == patch_iter - 1 and vox == 0: # NOTE: just plot for first voxel (last loop)
 
                             try:
                                 BAD = 1 - GOOD
                             except:
                                 BAD = np.zeros(flat_data.shape[-1])
 
-                            print(robust[vox])
-                            print("good:", BAD)
-                            order = np.argsort(ME)
+                            #print(robust[vox])
+                            #print("good:", BAD)
+                            order = np.argsort(RMSE)
                             RES = flat_data[vox] - np.exp(np.dot(design_matrix, params_flat[vox].T))
-                            fig, ax = plt.subplots(3, 1)
-                            ax[0].scatter(np.arange(flat_data.shape[1]), ME[order], c = BAD[order], cmap="RdYlGn")
+                            fig, ax = plt.subplots(4, 1)
+                            #ax[0].scatter(np.arange(flat_data.shape[1]), ME[order], c = BAD[order], cmap="RdYlGn")
+                            ax[0].scatter(np.arange(flat_data.shape[1]), RMSE[order], c = BAD[order], cmap="RdYlGn")
                             ax[0].set_title("metric value, red if corrupt")
                             ax[0].axhline(MED, ls="-")
+                            ax[0].axhline(C, ls="-", c="red")
                             ax[0].axhline(MED + 3*MAD, ls=":")
                             ax[0].axhline(MED - 3*MAD, ls=":")
-                            ax[1].scatter(np.arange(flat_data.shape[1]), ME[order], c = robust[vox][order], vmin=0, vmax=1)
+                            #ax[1].scatter(np.arange(flat_data.shape[1]), ME[order], c = robust[vox][order], vmin=0, vmax=1)
+                            ax[1].scatter(np.arange(flat_data.shape[1]), RMSE[order], c = robust[vox][order], vmin=0, vmax=1)
                             ax[1].set_title("metric value, color by if robust test (yellow=1)")
                             ax[1].axhline(MED, ls="-")
+                            ax[1].axhline(C, ls="-", c="red")
                             ax[1].axhline(MED + 3*MAD, ls=":")
                             ax[1].axhline(MED - 3*MAD, ls=":")
-                            ax[2].scatter(np.arange(flat_data.shape[1]), RES[order], c = PRED.mean(axis=0)[order])
-                            ax[2].set_title("residual values, color by if robust (yellow=1)")
+
+                            ax[2].scatter(np.arange(flat_data.shape[1]), 1/RMSE[order], c = PRED.mean(axis=0)[order])
+                            ax[3].scatter(np.arange(flat_data.shape[1]), RES[order], c = PRED.mean(axis=0)[order])
+                            ax[3].set_title("residual values, color by if robust (yellow=1)")
                             plt.show()
 
                     # fit signal
-                    non_outlier_idx = np.where(robust[vox] == 1)
-                    clean_design = design_matrix[non_outlier_idx]
-                    clean_data = flat_data[vox][non_outlier_idx]
-                    RMSE = RMSE[non_outlier_idx]
+                    if adx == patch_iter - 1:  # NOTE: only remove outliers on last pass
+                        non_outlier_idx = np.where(robust[vox] == 1)
+                        clean_design = design_matrix[non_outlier_idx]
+                        clean_data = flat_data[vox][non_outlier_idx]
+                        RMSE_clean = RMSE[non_outlier_idx]
+                    else:
+                        clean_design = design_matrix
+                        clean_data = flat_data[vox]
+                        RMSE_clean = RMSE
+                        
 
                     # final fit with  w = 1 / sigma^2 weights for r^2, with sigma := RMSE of patch (sigma for non-linear space)
-                    new_start = np.einsum('...ij,...j',
-                                           np.linalg.pinv(clean_design * (1.0 / RMSE[..., None])),
-                                           (1.0 / RMSE) * np.log(clean_data))
+                    if not(linear):  # calculate leverages now
+                        w = 1 / RMSE_clean
+                        tmp = np.linalg.pinv(clean_design * w[..., None]) * w[..., None].T
+                        new_start = tmp @ np.log(clean_data)
+                        if adx < patch_iter - 1:
+                            leverages[vox] = np.einsum('ij,ji->i', clean_design, tmp)
+                        else:
+                            leverages[vox, non_outlier_idx] = np.einsum('ij,ji->i', clean_design, tmp)
+                    else:  # calculate leverages later, since these depend on predicted signal
+                        new_start = np.einsum('...ij,...j',
+                                               np.linalg.pinv(clean_design * (1.0 / RMSE_clean[..., None])),
+                                               (1.0 / RMSE_clean) * np.log(clean_data))
+
                     if not(linear):
                         this_param, status = opt.leastsq(nlls.err_func,
                                                          new_start,
                                                          args=(clean_design,
                                                                clean_data,
                                                                'sigma',
-                                                               RMSE),
+                                                               RMSE_clean),
                                                          Dfun=Dfun)
                     else:
                         pred_sig = np.exp(new_start @ clean_design.T)
-                        w = pred_sig / RMSE
-                        this_param = np.einsum('...ij,...j',
-                                               np.linalg.pinv(clean_design * w[..., None]),
-                                               w * np.log(clean_data))
+                        w = pred_sig / RMSE_clean
+                        #this_param = np.einsum('...ij,...j',
+                        #                       np.linalg.pinv(clean_design * w[..., None]),
+                        #                       w * np.log(clean_data))
+                        tmp = np.linalg.pinv(clean_design * w[..., None]) * w[..., None].T
+                        this_param = tmp @ np.log(clean_data)
+                        if adx < patch_iter - 1:
+                            leverages[vox] = np.einsum('ij,ji->i', clean_design, tmp)
+                        else:
+                            leverages[vox, non_outlier_idx] = np.einsum('ij,ji->i', clean_design, tmp)
 
                     # update parameters (cannot replace params_flat yet, used in vox loop)
                     params_flat_2[vox, :] = this_param
