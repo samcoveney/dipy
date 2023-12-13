@@ -10,7 +10,7 @@ from dipy.reconst.dti import (TensorFit, mean_diffusivity,
                               from_lower_triangular,
                               lower_triangular, decompose_tensor,
                               MIN_POSITIVE_SIGNAL, nlls_fit_tensor,
-                              restore_fit_tensor)
+                              restore_fit_tensor, robust_fit_tensor)
 from dipy.reconst.utils import dki_design_matrix as design_matrix
 from dipy.reconst.recspeed import local_maxima
 from dipy.reconst.base import ReconstModel
@@ -2589,6 +2589,8 @@ common_fit_methods = {'WLS': ls_fit_dki,
                       'RT': restore_fit_tensor,
                       'restore': restore_fit_tensor,
                       'RESTORE': restore_fit_tensor,
+                      'robust': robust_fit_tensor,
+                      'ROBUST': robust_fit_tensor,
                       'CLS': cls_fit_dki,
                       'CWLS': cls_fit_dki
                       }

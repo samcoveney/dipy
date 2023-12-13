@@ -1334,7 +1334,11 @@ def iter_fit_tensor(step=1e4):
                                   return_S0_hat=return_S0_hat,
                                   *args, **kwargs)
             data = data.reshape(-1, data.shape[-1])
-            sz = 7 if kwargs.get('return_lower_triangular', False) else 12
+            # NOTE: code to make things work with DKI as well
+            if design_matrix.shape[-1] == 22: # DKI
+                sz = 22
+            else: # DTI
+                sz = 7 if kwargs.get('return_lower_triangular', False) else 12
             dtiparams = np.empty((size, sz), dtype=np.float64)
             if return_S0_hat:
                 S0params = np.empty(size, dtype=np.float64)
@@ -1464,7 +1468,9 @@ def wls_fit_tensor(design_matrix, data, return_S0_hat=False,
         leverages = np.einsum('ij,...ji->...i', design_matrix, tmp)
         #print(leverages.sum(axis=1))  # add up to 7, seem fine
 
-    leverages = {"leverages": leverages}
+    if leverages is not None:
+        leverages = {"leverages": leverages}
+
     if return_lower_triangular:
         return fit_result, leverages
 
@@ -2119,7 +2125,6 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
     log_flat_data = np.log(flat_data)
     leverages = np.empty_like(flat_data)
 
-    print("starting this")
     if not(linear):
         # calculate OLS solution
         D, extra = ols_fit_tensor(design_matrix, flat_data, return_lower_triangular=True, return_leverages=True)
@@ -2128,7 +2133,6 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
         # calculate WLS solution
         D, extra = wls_fit_tensor(design_matrix, flat_data, return_lower_triangular=True, return_leverages=True)
         leverages = extra["leverages"]
-    print("got here?")
 
     # Flatten for the iteration over voxels:
     ols_params = np.reshape(D, (-1, D.shape[-1]))
@@ -2225,10 +2229,10 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                     log_pred_sig = np.dot(design_matrix, this_param)
                     pred_sig = np.exp(log_pred_sig)
                     residuals = flat_data[vox] - pred_sig
+                    log_residuals = log_flat_data[vox] - log_pred_sig
                     if not(linear):
                         C = factor * np.median(np.abs(residuals - np.median(residuals)))
                     else:
-                        log_residuals = log_flat_data[vox] - log_pred_sig
                         z = pred_sig * log_residuals
                         C = factor * np.median(np.abs(z - np.median(z)))  # NOTE: IRLS eq9 correction
 
@@ -2320,7 +2324,9 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
         # If leastsq failed to converge and produced nans, we'll resort to the
         # OLS solution in this voxel:
         except (np.linalg.LinAlgError, TypeError) as e:
+        #except (TypeError) as e:
             resort_to_linear = True
+            #print(ols_params[vox])
             this_param = ols_params[vox]
             params_flat[vox] = this_param  # NOTE: still need a value for the adjacency loop
 
