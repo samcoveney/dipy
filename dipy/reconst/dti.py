@@ -2093,17 +2093,12 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
         return params, extra
 
 
-def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
+def robust_fit_tensor(design_matrix, data, jac=True,
                       return_S0_hat=False,
                       fail_is_nan=False,
                       linear=False,
                       cutoff=3,
-                      adjacency=None,
-                      always_gmm=False,
-                      use_gmm=True, # NOTE: this should turn off initial robust weighting
-                      patch_outliers=True,
-                      patch_iter=10,
-                      GOOD=None): # FIXME: remove GOOD, is only here to help development # NOTE: GOOD is actually indices of bad points
+                      always_gmm=False):
     """
     TODO: add this later.
     """
@@ -2154,6 +2149,7 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
     if return_S0_hat:
         model_S0 = np.empty((flat_data.shape[0], 1))
+
     for vox in range(flat_data.shape[0]):
         if np.all(flat_data[vox] == 0):
             raise ValueError("The data in this voxel contains only zeros")
@@ -2200,7 +2196,7 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
             # robust fitting using GMM weighting
             # ----------------------------------
-            if (cond_r or always_gmm) and use_gmm:
+            if cond_r or always_gmm:
 
                 # start with non-robust estimate
                 start_params = this_param
@@ -2265,18 +2261,8 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                 cond = cond_a | cond_b
                 robust[vox] = (cond == False)
 
-                # FIXME: if we don't do this, the parameters don't get saved from GMM at all (robust is saved)
-                #        is this what we want? Or should we save the GMM fit result if we are proceeding?
-                # refit without outliers, without GMM weights, only if not proceeding to do adjacency fitting
-                # -------------------------------------------------------------------------------------------
 
-                # FIXME: testing what happens if we save the GMM fit in the case that we later do the iterative adjacency stuff
-                if patch_iter > 0: 
-                    params_flat[vox, :] = this_param
-                    C_all[vox] = C
-                    leverages[vox] = np.diag(HAT)  # NOTE updating these here, because they are used in the patch routine
-
-                if np.any(cond) and patch_iter == 0:  # NOTE: only doing this 'clean fit' if not doing patch
+                if np.any(cond):
 
                     # If you still have outliers, refit without those outliers:
                     non_outlier_idx = np.where(cond == False)
@@ -2313,7 +2299,6 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                     # update with fit from clean data
                     params_flat[vox, :] = this_param
                     C_all[vox] = C
-                    # NOTE: haven't calculated new leverages for clean fit, should be fine becase we only get here if not proceeding any further
 
             # Convert diffusion tensor parameters to the evals and the evecs:
             evals, evecs = decompose_tensor(
@@ -2324,9 +2309,7 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
         # If leastsq failed to converge and produced nans, we'll resort to the
         # OLS solution in this voxel:
         except (np.linalg.LinAlgError, TypeError) as e:
-        #except (TypeError) as e:
             resort_to_linear = True
-            #print(ols_params[vox])
             this_param = ols_params[vox]
             params_flat[vox] = this_param  # NOTE: still need a value for the adjacency loop
 
@@ -2336,7 +2319,7 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
                     from_lower_triangular(this_param[:6]))
                 params[vox, :3] = evals
                 params[vox, 3:12] = evecs.ravel()
-            else:  # FIXME: can't really have this case if doing reweighting below, PROBABLY REMOVE THIS OPTION IF PATCH_ITER > 0
+            else:
                 # Set NaN values
                 params[vox, :] = np.nan
 
@@ -2346,245 +2329,331 @@ def robust_fit_tensor(design_matrix, data, sigma=None, jac=True,
             md2 = evals.mean(0) ** 2
             params[vox, 12:] = params_flat[vox, 6:-1] / md2
 
+    if resort_to_linear:
+        warnings.warn("Resorted to OLS solution in some voxels", UserWarning)
 
-    # code to check spatial patch for correlations, improve 'robust', refit
-    # ---------------------------------------------------------------------
-    if patch_iter > 0:
+    params.shape = data.shape[:-1] + (npa,)
+    extra = {"robust": robust}
+    if return_S0_hat:
+        model_S0.shape = data.shape[:-1] + (1,)
+        return [params, model_S0], extra
+    else:
+        return params, extra
 
-        params_flat_2 = np.empty_like(params_flat)  # NOTE: use this to store updated params_flat, so we can loop this process and see what happens
 
-        for adx in range(patch_iter):  # loop large number of times, not necessarily a way to test convergence, because all results rely on all others... 
-            
-            if adx > 0: params_flat[:] = params_flat_2  # updated params from last patch-based reweighting
+def retwiq_fit_tensor(design_matrix, data, jac=True,
+                      return_S0_hat=False,
+                      fail_is_nan=False,
+                      linear=False,
+                      cutoff=3,
+                      adjacency=None,
+                      patch_outliers=True,
+                      patch_iter=10):
+    """
+    TODO: add this later.
+    """
+    # Detect number of parameters to estimate from design_matrix length plus
+    # 5 due to diffusion tensor conversion to eigenvalue and eigenvectors
+    p = design_matrix.shape[-1]
+    N = data.shape[-1]
 
-            LOGP_all = np.dot(design_matrix, params_flat.T).T
-            PRED_all = np.exp(LOGP_all)
+    # Detect if number of parameters corresponds to dti
+    npa = p + 5
+    dti = (npa == 12)
 
-            # will be calculated from initial OLS/WLS fit, and after each 1/RMSE reweighting
-            # FIXME: experimenting with keeping the GMM fit result leverages in the code above
-            HAT_factor_all = np.sqrt(1 - leverages)
+    # Flatten for the iteration over voxels:
+    flat_data = data.reshape((-1, N))
+    log_flat_data = np.log(flat_data)
+    leverages = np.empty_like(flat_data)
+    factor = 1.4826 * np.sqrt(N / (N - p))
 
-            # if using all voxels, only need a single RMSE calculation
-            if adjacency is None:
-                LOGP = LOGP_all
-                PRED = PRED_all
-                LOGY = log_flat_data
-                Y = flat_data
-                HAT_factor = HAT_factor_all
+    if not(linear):
+        # calculate OLS solution
+        D, extra = ols_fit_tensor(design_matrix, flat_data, return_lower_triangular=True, return_leverages=True)
+        leverages[:] = extra["leverages"]
+    else:
+        # calculate WLS solution
+        D, extra = wls_fit_tensor(design_matrix, flat_data, return_lower_triangular=True, return_leverages=True)
+        leverages = extra["leverages"]
 
-                # calculate C from all
-                residuals = (Y - PRED)
+    # flatten initial results
+    params_flat = np.reshape(D, (-1, D.shape[-1]))
+
+    # Initialize parameter matrix
+    params = np.empty((flat_data.shape[0], npa))
+    #C_all = np.empty(flat_data.shape[0])
+
+    # For storing whether image is used in final fit for each voxel
+    robust = np.ones(flat_data.shape, dtype=int)
+
+    # For warnings
+    resort_to_linear = False
+
+    # Instance of _NllsHelper, need for nlls error func and jacobian
+    nlls = _NllsHelper()
+    Dfun = nlls.jacobian_func if jac else None
+
+    if return_S0_hat:
+        model_S0 = np.empty((flat_data.shape[0], 1))
+
+    # for storing parameter updates while looping over voxels
+    params_flat_2 = np.empty_like(params_flat)
+
+    for adx in range(patch_iter):
+        
+        if adx > 0: params_flat[:] = params_flat_2  # updated params from last patch-based reweighting
+
+        LOGP_all = np.dot(design_matrix, params_flat.T).T
+        PRED_all = np.exp(LOGP_all)
+
+        # leverages from initial OLS/WLS fit for adx = 0, then for 1/RMSE reweighting for adx > 0
+        HAT_factor_all = np.sqrt(1 - leverages)
+
+        # if using all voxels, only need a single RMSE calculation
+        if adjacency is None:
+            LOGP = LOGP_all
+            PRED = PRED_all
+            LOGY = log_flat_data
+            Y = flat_data
+            HAT_factor = HAT_factor_all
+
+            # calculate C from all adjacent voxels 
+            residuals = (Y - PRED)
+            if patch_outliers and adx == patch_iter - 1:
+                if not(linear):
+                    C = factor * np.median(np.abs(residuals - np.median(residuals)))
+                else:
+                    log_residuals = (LOGY - LOGP)
+                    z = PRED * log_residuals
+                    C = factor * np.median(np.abs(z - np.median(z)))  # NOTE: IRLS eq9 correction
+
+            # calculate RMSE = sigma, for 1/sigma^2 weighting of residuals^2 - sigma is error stdev in *non-linear* space
+            yy = residuals / HAT_factor
+            MSE = (yy**2).mean(axis=0)
+            RMSE = np.sqrt(MSE)
+
+            #{{{ debugging plots
+            if False and adx == patch_iter - 1:
+
+                MED = np.median(RMSE)
+                MAD = np.median(np.abs(RMSE - MED))
+                MAD = MAD * 1.4826
+
+                try:
+                    BAD = 1 - GOOD
+                except:
+                    BAD = np.zeros(flat_data.shape[-1])
+
+                #print(robust[vox])
+                #print("good:", BAD)
+                order = np.argsort(RMSE)
+                RES = flat_data[vox] - np.exp(np.dot(design_matrix, params_flat[vox].T))
+                fig, ax = plt.subplots(4, 1)
+                plt.suptitle("adx: " + str(adx))
+                #ax[0].scatter(np.arange(flat_data.shape[1]), ME[order], c = BAD[order], cmap="RdYlGn")
+                ax[0].scatter(np.arange(flat_data.shape[1]), RMSE[order], c = BAD[order], cmap="RdYlGn")
+                ax[0].set_title("metric value, red if corrupt")
+                ax[0].axhline(MED, ls="-")
+                ax[0].axhline(C, ls="-", c="red")
+                ax[0].axhline(MED + 3*MAD, ls=":")
+                ax[0].axhline(MED - 3*MAD, ls=":")
+                #ax[1].scatter(np.arange(flat_data.shape[1]), ME[order], c = robust[vox][order], vmin=0, vmax=1)
+                ax[1].scatter(np.arange(flat_data.shape[1]), RMSE[order], c = robust[vox][order], vmin=0, vmax=1)
+                ax[1].set_title("metric value, color by if robust test (yellow=1)")
+                ax[1].axhline(MED, ls="-")
+                ax[1].axhline(C, ls="-", c="red")
+                ax[1].axhline(MED + 3*MAD, ls=":")
+                ax[1].axhline(MED - 3*MAD, ls=":")
+
+                ax[2].scatter(np.arange(flat_data.shape[1]), 1/RMSE[order], c = PRED.mean(axis=0)[order])
+                ax[2].set_title("1/RMSE, colored by mean signal (tells us bval)")
+
+                ax[3].scatter(np.arange(flat_data.shape[1]), RES[order], c = PRED.mean(axis=0)[order])
+                ax[3].set_title("residual values, colored by mean signal (tells us bval)")
+                plt.show()
+            #}}}
+
+        for vox in range(flat_data.shape[0]):
+
+            try:
+
+                # if using local patch / neighborhood, each voxel requires new RMSE calculation
+                if adjacency is not None:
+                    LOGP = LOGP_all[adjacency[vox]]
+                    PRED = PRED_all[adjacency[vox]]
+                    LOGY = log_flat_data[adjacency[vox]]
+                    Y = flat_data[adjacency[vox]]
+                    HAT_factor = HAT_factor_all[adjacency[vox]]
+
+                    # calculate C from all adjacent voxels 
+                    residuals = (Y - PRED)
+                    if patch_outliers and adx == patch_iter - 1:
+                        if not(linear):
+                            C = factor * np.median(np.abs(residuals - np.median(residuals)))
+                        else:
+                            log_residuals = (LOGY - LOGP)
+                            z = PRED * log_residuals
+                            C = factor * np.median(np.abs(z - np.median(z)))  # NOTE: IRLS eq9 correction
+
+                    # calculate RMSE = sigma, for 1/sigma^2 weighting of residuals^2 - sigma is error stdev in *non-linear* space
+                    yy = residuals / HAT_factor
+                    MSE = (yy**2).mean(axis=0)
+                    RMSE = np.sqrt(MSE)
+
+                    #{{{ debugging plots
+                    if False and adx == patch_iter - 1: #and vox == 0: # NOTE: just plot for first voxel (last loop)
+
+                        #print(robust[vox])
+                        #print("good:", BAD)
+                        order = np.argsort(RMSE)
+                        RES = flat_data[vox] - np.exp(np.dot(design_matrix, params_flat[vox].T))
+                        fig, ax = plt.subplots(3, 1)
+                        #ax[1].scatter(np.arange(flat_data.shape[1]), ME[order], c = robust[vox][order], vmin=0, vmax=1)
+                        ax[0].scatter(np.arange(flat_data.shape[1]), RMSE[order], c = robust[vox][order], vmin=0, vmax=1)
+                        ax[0].set_title("metric value, color by if robust test (yellow=1)")
+                        #ax[0].axhline(MED, ls="-")
+                        #ax[0].axhline(C, ls="-", c="red")
+                        #ax[0].axhline(MED + 3*MAD, ls=":")
+                        #ax[0].axhline(MED - 3*MAD, ls=":")
+
+                        ax[1].scatter(np.arange(flat_data.shape[1]), 1/RMSE[order], c = PRED.mean(axis=0)[order])
+                        ax[1].set_title("1/RMSE, color by mean signal (implies bval)")
+
+                        ax[2].scatter(np.arange(flat_data.shape[1]), RES[order], c = PRED.mean(axis=0)[order])
+                        ax[2].set_title("residual values, color by mean signal (implies bval)")
+                        plt.show()
+                    #}}}
+
                 if patch_outliers and adx == patch_iter - 1:
-                    if not(linear):
-                        C = factor * np.median(np.abs(residuals - np.median(residuals)))
-                    else:
-                        log_residuals = (LOGY - LOGP)
-                        z = PRED * log_residuals
-                        C = factor * np.median(np.abs(z - np.median(z)))  # NOTE: IRLS eq9 correction
 
-                # calculate RMSE = sigma, for 1/sigma^2 weighting of residuals^2 - sigma is error stdev in *non-linear* space
-                yy = residuals / HAT_factor  # NOTE: have attempted to studentize
-                MSE = (yy**2).mean(axis=0)
-                RMSE = np.sqrt(MSE)
-
-                #{{{ debugging plots
-                if False and adx == patch_iter - 1:
-
+                    # multivariate outlier condition
+                    # ------------------------------
                     MED = np.median(RMSE)
                     MAD = np.median(np.abs(RMSE - MED))
                     MAD = MAD * 1.4826
+                    MV_cutoff = 3
+                    MV_cond = (RMSE > (MED + MV_cutoff*MAD)) | (RMSE < (MED - MV_cutoff*MAD))
+                    robust[vox, MV_cond] = 0
 
-                    try:
-                        BAD = 1 - GOOD
-                    except:
-                        BAD = np.zeros(flat_data.shape[-1])
+                    # univariate outlier test
+                    # -----------------------
+                    # using leverages from 1/RMSE weighted fit
+                    # C is calculated over all signals in patch
+                    LOGP_vox = LOGP_all[vox]
+                    PRED_vox = PRED_all[vox]
+                    LOGY_vox = log_flat_data[vox]
+                    Y_vox = flat_data[vox]
+                    HAT_factor_vox = HAT_factor_all[vox]
+                    log_residuals_vox = (LOGY_vox - LOGP_vox)
+                    residuals_vox = (Y_vox - PRED_vox)
+                    cond_a = (residuals_vox > +cutoff*C*HAT_factor_vox) | (log_residuals_vox < -cutoff*C*HAT_factor_vox/PRED_vox)
+                    cond_b = (log_residuals_vox > +cutoff*C*HAT_factor_vox/PRED_vox) | (residuals_vox < -cutoff*C*HAT_factor_vox)
+                    cond = cond_a | cond_b
+                    robust[vox, cond] = 0
 
-                    #print(robust[vox])
-                    #print("good:", BAD)
-                    order = np.argsort(RMSE)
-                    RES = flat_data[vox] - np.exp(np.dot(design_matrix, params_flat[vox].T))
-                    fig, ax = plt.subplots(4, 1)
-                    plt.suptitle("adx: " + str(adx))
-                    #ax[0].scatter(np.arange(flat_data.shape[1]), ME[order], c = BAD[order], cmap="RdYlGn")
-                    ax[0].scatter(np.arange(flat_data.shape[1]), RMSE[order], c = BAD[order], cmap="RdYlGn")
-                    ax[0].set_title("metric value, red if corrupt")
-                    ax[0].axhline(MED, ls="-")
-                    ax[0].axhline(C, ls="-", c="red")
-                    ax[0].axhline(MED + 3*MAD, ls=":")
-                    ax[0].axhline(MED - 3*MAD, ls=":")
-                    #ax[1].scatter(np.arange(flat_data.shape[1]), ME[order], c = robust[vox][order], vmin=0, vmax=1)
-                    ax[1].scatter(np.arange(flat_data.shape[1]), RMSE[order], c = robust[vox][order], vmin=0, vmax=1)
-                    ax[1].set_title("metric value, color by if robust test (yellow=1)")
-                    ax[1].axhline(MED, ls="-")
-                    ax[1].axhline(C, ls="-", c="red")
-                    ax[1].axhline(MED + 3*MAD, ls=":")
-                    ax[1].axhline(MED - 3*MAD, ls=":")
+                    #{{{ debugging plots
+                    if False and adx == patch_iter - 1 and vox == 0: # NOTE: just plot for first voxel (last loop)
 
-                    ax[2].scatter(np.arange(flat_data.shape[1]), 1/RMSE[order], c = PRED.mean(axis=0)[order])
-                    ax[2].set_title("1/RMSE, colored by mean signal (tells us bval)")
+                        try:
+                            BAD = 1 - GOOD
+                        except:
+                            BAD = np.zeros(flat_data.shape[-1])
 
-                    ax[3].scatter(np.arange(flat_data.shape[1]), RES[order], c = PRED.mean(axis=0)[order])
-                    ax[3].set_title("residual values, colored by mean signal (tells us bval)")
-                    plt.show()
-                #}}}
+                        #print(robust[vox])
+                        #print("good:", BAD)
+                        order = np.argsort(RMSE)
+                        RES = flat_data[vox] - np.exp(np.dot(design_matrix, params_flat[vox].T))
+                        fig, ax = plt.subplots(4, 1)
+                        #ax[0].scatter(np.arange(flat_data.shape[1]), ME[order], c = BAD[order], cmap="RdYlGn")
+                        ax[0].scatter(np.arange(flat_data.shape[1]), RMSE[order], c = BAD[order], cmap="RdYlGn")
+                        ax[0].set_title("metric value, red if corrupt")
+                        ax[0].axhline(MED, ls="-")
+                        ax[0].axhline(C, ls="-", c="red")
+                        ax[0].axhline(MED + 3*MAD, ls=":")
+                        ax[0].axhline(MED - 3*MAD, ls=":")
+                        #ax[1].scatter(np.arange(flat_data.shape[1]), ME[order], c = robust[vox][order], vmin=0, vmax=1)
+                        ax[1].scatter(np.arange(flat_data.shape[1]), RMSE[order], c = robust[vox][order], vmin=0, vmax=1)
+                        ax[1].set_title("metric value, color by if robust test (yellow=1)")
+                        ax[1].axhline(MED, ls="-")
+                        ax[1].axhline(C, ls="-", c="red")
+                        ax[1].axhline(MED + 3*MAD, ls=":")
+                        ax[1].axhline(MED - 3*MAD, ls=":")
 
-            for vox in range(flat_data.shape[0]):
+                        ax[2].scatter(np.arange(flat_data.shape[1]), 1/RMSE[order], c = PRED.mean(axis=0)[order])
+                        ax[2].set_title("1/RMSE, color by mean signal (implies bval)")
 
-                try:
+                        ax[3].scatter(np.arange(flat_data.shape[1]), RES[order], c = PRED.mean(axis=0)[order])
+                        ax[3].set_title("residual values, color by mean signal (implies bval)")
+                        plt.show()
+                    #}}}
 
-                    # if using local patch / neighborhood, each voxel requires new RMSE calculation
-                    if adjacency is not None:
-                        LOGP = LOGP_all[adjacency[vox]]
-                        PRED = PRED_all[adjacency[vox]]
-                        LOGY = log_flat_data[adjacency[vox]]
-                        Y = flat_data[adjacency[vox]]
-                        HAT_factor = HAT_factor_all[adjacency[vox]]
+                # fit signal
+                if adx == patch_iter - 1:  # NOTE: only remove outliers on last pass
+                    non_outlier_idx = np.where(robust[vox] == 1)
+                    clean_design = design_matrix[non_outlier_idx]
+                    clean_data = flat_data[vox][non_outlier_idx]
+                    RMSE_clean = RMSE[non_outlier_idx]
+                else:
+                    clean_design = design_matrix
+                    clean_data = flat_data[vox]
+                    RMSE_clean = RMSE
+                    
 
-                        # calculate C from all adjacent voxels 
-                        residuals = (Y - PRED)
-                        if patch_outliers and adx == patch_iter - 1:
-                            if not(linear):
-                                C = factor * np.median(np.abs(residuals - np.median(residuals)))
-                            else:
-                                log_residuals = (LOGY - LOGP)
-                                z = PRED * log_residuals
-                                C = factor * np.median(np.abs(z - np.median(z)))  # NOTE: IRLS eq9 correction
-
-                        # calculate RMSE = sigma, for 1/sigma^2 weighting of residuals^2 - sigma is error stdev in *non-linear* space
-                        yy = residuals / HAT_factor  # NOTE: have attempted to studentize
-                        MSE = (yy**2).mean(axis=0)
-                        RMSE = np.sqrt(MSE)
-
-                    if patch_outliers and adx == patch_iter - 1:  # NOTE: new addition, only remove outliers on last pass
-
-                        # multivariate outlier condition
-                        # ------------------------------
-                        MED = np.median(RMSE)
-                        MAD = np.median(np.abs(RMSE - MED))
-                        MAD = MAD * 1.4826
-                        MV_cutoff = 3
-                        MV_cond = (RMSE > (MED + MV_cutoff*MAD)) | (RMSE < (MED - MV_cutoff*MAD))
-                        robust[vox, MV_cond] = 0
-
-                        # univariate outlier test
-                        # -----------------------
-                        # FIXME 1: do we really want to incorporate the leverages from 1/RMSE weighing into a univariate test?
-                        # FIXME 2: should we have a per-voxel C, rather than assume constant over an entire patch?
-                        LOGP_vox = LOGP_all[vox]
-                        PRED_vox = PRED_all[vox]
-                        LOGY_vox = log_flat_data[vox]
-                        Y_vox = flat_data[vox]
-                        HAT_factor_vox = HAT_factor_all[vox]
-                        log_residuals_vox = (LOGY_vox - LOGP_vox)
-                        residuals_vox = (Y_vox - PRED_vox)
-                        cond_a = (residuals_vox > +cutoff*C*HAT_factor_vox) | (log_residuals_vox < -cutoff*C*HAT_factor_vox/PRED_vox)
-                        cond_b = (log_residuals_vox > +cutoff*C*HAT_factor_vox/PRED_vox) | (residuals_vox < -cutoff*C*HAT_factor_vox)
-                        cond = cond_a | cond_b
-                        robust[vox, cond] = 0
-
-                        #{{{ debugging plots
-                        if False and adx == patch_iter - 1 and vox == 0: # NOTE: just plot for first voxel (last loop)
-
-                            try:
-                                BAD = 1 - GOOD
-                            except:
-                                BAD = np.zeros(flat_data.shape[-1])
-
-                            #print(robust[vox])
-                            #print("good:", BAD)
-                            order = np.argsort(RMSE)
-                            RES = flat_data[vox] - np.exp(np.dot(design_matrix, params_flat[vox].T))
-                            fig, ax = plt.subplots(4, 1)
-                            #ax[0].scatter(np.arange(flat_data.shape[1]), ME[order], c = BAD[order], cmap="RdYlGn")
-                            ax[0].scatter(np.arange(flat_data.shape[1]), RMSE[order], c = BAD[order], cmap="RdYlGn")
-                            ax[0].set_title("metric value, red if corrupt")
-                            ax[0].axhline(MED, ls="-")
-                            ax[0].axhline(C, ls="-", c="red")
-                            ax[0].axhline(MED + 3*MAD, ls=":")
-                            ax[0].axhline(MED - 3*MAD, ls=":")
-                            #ax[1].scatter(np.arange(flat_data.shape[1]), ME[order], c = robust[vox][order], vmin=0, vmax=1)
-                            ax[1].scatter(np.arange(flat_data.shape[1]), RMSE[order], c = robust[vox][order], vmin=0, vmax=1)
-                            ax[1].set_title("metric value, color by if robust test (yellow=1)")
-                            ax[1].axhline(MED, ls="-")
-                            ax[1].axhline(C, ls="-", c="red")
-                            ax[1].axhline(MED + 3*MAD, ls=":")
-                            ax[1].axhline(MED - 3*MAD, ls=":")
-
-                            ax[2].scatter(np.arange(flat_data.shape[1]), 1/RMSE[order], c = PRED.mean(axis=0)[order])
-                            ax[2].set_title("1/RMSE, color by mean signal (implies bval)")
-
-                            ax[3].scatter(np.arange(flat_data.shape[1]), RES[order], c = PRED.mean(axis=0)[order])
-                            ax[3].set_title("residual values, color by mean signal (implies bval)")
-                            plt.show()
-                        #}}}
-
-                    # fit signal
-                    if adx == patch_iter - 1:  # NOTE: only remove outliers on last pass
-                        non_outlier_idx = np.where(robust[vox] == 1)
-                        clean_design = design_matrix[non_outlier_idx]
-                        clean_data = flat_data[vox][non_outlier_idx]
-                        RMSE_clean = RMSE[non_outlier_idx]
+                # final fit with  w = 1 / sigma^2 weights for r^2, with sigma := RMSE of patch (sigma for non-linear space)
+                if not(linear):  # calculate leverages now
+                    w = 1 / RMSE_clean
+                    tmp = np.linalg.pinv(clean_design * w[..., None]) * w[..., None].T
+                    new_start = tmp @ np.log(clean_data)
+                    if adx < patch_iter - 1:
+                        leverages[vox] = np.einsum('ij,ji->i', clean_design, tmp)
                     else:
-                        clean_design = design_matrix
-                        clean_data = flat_data[vox]
-                        RMSE_clean = RMSE
-                        
+                        leverages[vox, non_outlier_idx] = np.einsum('ij,ji->i', clean_design, tmp)
+                else:  # calculate leverages later, since these depend on predicted signal
+                    new_start = np.einsum('...ij,...j',
+                                           np.linalg.pinv(clean_design * (1.0 / RMSE_clean[..., None])),
+                                           (1.0 / RMSE_clean) * np.log(clean_data))
 
-                    # final fit with  w = 1 / sigma^2 weights for r^2, with sigma := RMSE of patch (sigma for non-linear space)
-                    if not(linear):  # calculate leverages now
-                        w = 1 / RMSE_clean
-                        tmp = np.linalg.pinv(clean_design * w[..., None]) * w[..., None].T
-                        new_start = tmp @ np.log(clean_data)
-                        if adx < patch_iter - 1:
-                            leverages[vox] = np.einsum('ij,ji->i', clean_design, tmp)
-                        else:
-                            leverages[vox, non_outlier_idx] = np.einsum('ij,ji->i', clean_design, tmp)
-                    else:  # calculate leverages later, since these depend on predicted signal
-                        new_start = np.einsum('...ij,...j',
-                                               np.linalg.pinv(clean_design * (1.0 / RMSE_clean[..., None])),
-                                               (1.0 / RMSE_clean) * np.log(clean_data))
-
-                    if not(linear):
-                        this_param, status = opt.leastsq(nlls.err_func,
-                                                         new_start,
-                                                         args=(clean_design,
-                                                               clean_data,
-                                                               'sigma',
-                                                               RMSE_clean),
-                                                         Dfun=Dfun)
+                if not(linear):
+                    this_param, status = opt.leastsq(nlls.err_func,
+                                                     new_start,
+                                                     args=(clean_design,
+                                                           clean_data,
+                                                           'sigma',
+                                                           RMSE_clean),
+                                                     Dfun=Dfun)
+                else:
+                    pred_sig = np.exp(new_start @ clean_design.T)
+                    w = pred_sig / RMSE_clean
+                    tmp = np.linalg.pinv(clean_design * w[..., None]) * w[..., None].T
+                    this_param = tmp @ np.log(clean_data)
+                    if adx < patch_iter - 1:
+                        leverages[vox] = np.einsum('ij,ji->i', clean_design, tmp)
                     else:
-                        pred_sig = np.exp(new_start @ clean_design.T)
-                        w = pred_sig / RMSE_clean
-                        tmp = np.linalg.pinv(clean_design * w[..., None]) * w[..., None].T
-                        this_param = tmp @ np.log(clean_data)
-                        if adx < patch_iter - 1:
-                            leverages[vox] = np.einsum('ij,ji->i', clean_design, tmp)
-                        else:
-                            leverages[vox, non_outlier_idx] = np.einsum('ij,ji->i', clean_design, tmp)
+                        leverages[vox, non_outlier_idx] = np.einsum('ij,ji->i', clean_design, tmp)
 
-                    # update parameters (cannot replace params_flat yet, used in vox loop)
-                    params_flat_2[vox, :] = this_param
+                # update parameters (cannot replace params_flat yet, used in vox loop)
+                params_flat_2[vox, :] = this_param
 
-                except:  # if something failed, just set to params_flat NOTE: may need to set to value determined before adjacency tests
-                    params_flat_2[vox, :] = params_flat[vox, :]
+            except:  # if something failed, just set to params_flat
+                params_flat_2[vox, :] = params_flat[vox, :]
 
 
-        # save results into correct arrays
-        params_flat[:] = params_flat_2       
-        for vox in range(flat_data.shape[0]):
-            this_param = params_flat[vox]
+    # save results into correct arrays
+    params_flat[:] = params_flat_2       
+    for vox in range(flat_data.shape[0]):
+        this_param = params_flat[vox]
 
-            # Convert diffusion tensor parameters to the evals and the evecs:
-            evals, evecs = decompose_tensor(
-                from_lower_triangular(this_param[:6]))
-            params[vox, :3] = evals
-            params[vox, 3:12] = evecs.ravel()
+        # Convert diffusion tensor parameters to the evals and the evecs:
+        evals, evecs = decompose_tensor(
+            from_lower_triangular(this_param[:6]))
+        params[vox, :3] = evals
+        params[vox, 3:12] = evecs.ravel()
 
-            if return_S0_hat:
-                model_S0[vox] = np.exp(-this_param[-1])
-            if not dti:
-                md2 = evals.mean(0) ** 2
-                params[vox, 12:] = this_param[6:-1] / md2
+        if return_S0_hat:
+            model_S0[vox] = np.exp(-this_param[-1])
+        if not dti:
+            md2 = evals.mean(0) ** 2
+            params[vox, 12:] = this_param[6:-1] / md2
 
     if resort_to_linear:
         warnings.warn("Resorted to OLS solution in some voxels", UserWarning)
@@ -2807,5 +2876,7 @@ common_fit_methods = {'WLS': wls_fit_tensor,
                       'restore': restore_fit_tensor,
                       'RESTORE': restore_fit_tensor,
                       'robust': robust_fit_tensor,
-                      'ROBUST': robust_fit_tensor
+                      'ROBUST': robust_fit_tensor,
+                      'retwiq': retwiq_fit_tensor,
+                      'RETWIQ': retwiq_fit_tensor
                       }
