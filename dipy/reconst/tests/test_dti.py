@@ -382,6 +382,21 @@ def test_wls_and_ls_fit():
     npt.assert_array_almost_equal(tensor_est.planarity, planarity(evals))
     npt.assert_array_almost_equal(tensor_est.sphericity, sphericity(evals))
 
+    # testing that leverages are returned on request
+    for fit_method in ['LS', 'WLS']:
+        # Estimate tensor from test signals, not returning leverages
+        model = TensorModel(gtab, fit_method=fit_method, return_S0_hat=True, return_leverages=False)
+        tensor_est = model.fit(Y)
+        npt.assert_equal(tensor_est.model.extra, None)
+
+        # Estimate tensor from test signals, returning leverages
+        model = TensorModel(gtab, fit_method=fit_method, return_S0_hat=True, return_leverages=True)
+        tensor_est = model.fit(Y)
+        npt.assert_equal(tensor_est.model.extra["leverages"].shape, Y.shape)
+
+        # test value of leverage is 7 (in this case, for DTI)
+        npt.assert_almost_equal(tensor_est.model.extra["leverages"].sum(axis=1), np.array([7.0]))
+
 
 def test_masked_array_with_tensor():
     data = np.ones((2, 4, 56))
@@ -702,6 +717,9 @@ def test_restore():
                                               decimal=3)
                 npt.assert_array_almost_equal(tensor_est.quadratic_form[0],
                                               tensor, decimal=3)
+            
+                # test recording of robust signals
+                npt.assert_equal(tensor_est.model.extra["robust"].shape, Y.shape)
 
     # If sigma is very small, it still needs to work:
     tensor_model = dti.TensorModel(gtab, fit_method='restore', sigma=0.0001)
@@ -724,6 +742,84 @@ def test_restore():
                                    return_S0_hat=True, fail_is_nan=True)
     tmf = npt.assert_warns(UserWarning, tensor_model.fit, Y.copy())
     npt.assert_equal(tmf[0].S0_hat, np.nan)
+
+
+def test_robust_and_retwiq():
+    """
+    Test the implementation of the RESTORE algorithm
+    """
+    b0 = 1000.
+    bval, bvecs = read_bvals_bvecs(*get_fnames('55dir_grad'))
+    gtab = grad.gradient_table(bval, bvecs)
+    B = bval[1]
+
+    # Scale the eigenvalues and tensor by the B value so the units match
+    D = np.array([1., 1., 1., 0., 0., 1., -np.log(b0) * B]) / B
+    evals = np.array([2., 1., 0.]) / B
+    tensor = from_lower_triangular(D)
+
+    # Design Matrix
+    X = dti.design_matrix(gtab)
+
+    # Signals
+    Y = np.exp(np.dot(X, D))
+    Y = np.vstack([Y[None, :], Y[None, :]])  # two voxels
+    for method in ["robust", "retwiq"]:
+        #for drop_this in range(1, 5): # NOTE: modified this for speed
+        for drop_this in range(1, Y.shape[-1]):
+            for jac in [True, False]:
+                # estimates should be robust to dropping
+                this_y = Y.copy()
+                this_y[:, drop_this] = 1.0
+
+                for linear in [True, False]:
+                    tensor_model = dti.TensorModel(gtab, fit_method=method, linear=linear)
+
+                    tensor_est = tensor_model.fit(this_y)
+                    npt.assert_array_almost_equal(tensor_est.evals[0], evals,
+                                                  decimal=3)
+                    npt.assert_array_almost_equal(tensor_est.quadratic_form[0],
+                                                  tensor, decimal=3)
+                
+                    # test recording of robust signals
+                    npt.assert_equal(tensor_est.model.extra["robust"].shape, Y.shape)
+
+        # Test return_S0_hat
+        for linear in [True, False]:
+            tensor_model = dti.TensorModel(gtab, fit_method=method,
+                                           return_S0_hat=True)
+            this_y = Y.copy()
+            this_y[:, 1] = 1.0
+            tmf = tensor_model.fit(this_y)
+            npt.assert_almost_equal(tmf[0].S0_hat, b0)
+
+        # Test error if not enough data
+        for linear in [True, False]:
+            gtab_tiny = grad.gradient_table(bval[0:7], bvecs[0:7])
+            tensor_model = dti.TensorModel(gtab_tiny, fit_method=method,
+                                           return_S0_hat=True, linear=False)
+            tmf = npt.assert_raises(ValueError, tensor_model.fit, this_y[:, 0:7])
+
+        # Test warning for failure of NLLS method, resort to OLS result
+        # (reason for failure: too few data points for NLLS, due to negative sigma)
+        for linear in [True, False]:
+            if method == "robust":
+                gtab_tiny = grad.gradient_table(bval[0:8], bvecs[0:8])
+                this_y = Y.copy()
+                this_y[:, 1:] = 1.0  # otherwise there are no residuals
+                # FIXME: not sure how to make this fail, in restore it was easier because can define negative sigma
+                tensor_model = dti.TensorModel(gtab_tiny, fit_method=method,
+                                               return_S0_hat=True, linear=False)
+                tmf = npt.assert_warns(UserWarning, tensor_model.fit, this_y[:, 0:8])
+
+        # Test fail_is_nan=True, failed NLLS method gives NaN
+        if False:
+            for linear in [True, False]:
+                tensor_model = dti.TensorModel(gtab, fit_method=method,
+                                               return_S0_hat=True, linear=False,
+                                               fail_is_nan=True)
+                tmf = npt.assert_warns(UserWarning, tensor_model.fit, this_y)
+                npt.assert_equal(tmf[0].S0_hat, np.nan)
 
 
 def test_adc():
@@ -874,3 +970,55 @@ def test_design_matrix_lte():
     B_btens_none = dti.design_matrix(gtab_btens_none)
     B_btens_lte = dti.design_matrix(gtab_btens_lte)
     npt.assert_array_almost_equal(B_btens_none, B_btens_lte, decimal=1)
+
+
+def test_extra_return():
+    """
+    Test if returns of dictionary 'extra' from fitting functions are working
+    properly.
+
+    Uses data/55dir_grad as the gradient table and 3by3by56.nii
+    as the data.
+
+    """
+
+    # testing restore, robust, and retwiq
+    b0 = 1000.
+    bval, bvecs = read_bvals_bvecs(*get_fnames('55dir_grad'))
+    gtab = grad.gradient_table(bval, bvecs)
+    B = bval[1]
+
+    # Scale the eigenvalues and tensor by the B value so the units match
+    D = np.array([1., 1., 1., 0., 0., 1., -np.log(b0) * B]) / B
+    evals = np.array([2., 1., 0.]) / B
+    tensor = from_lower_triangular(D)
+
+    # Design Matrix
+    X = dti.design_matrix(gtab)
+
+    # Signals
+    Y = np.exp(np.dot(X, D))
+    Y = np.vstack([Y[None, :], Y[None, :]])  # two voxels
+    for drop_this in range(1, 3): # Y.shape[-1]):
+        for method in ["restore", "robust", "retwiq"]:
+            this_y = Y.copy()
+            this_y[:, drop_this] = 1.0
+
+            sigma = 0.0001
+
+            if method == "restore":
+                tensor_model = dti.TensorModel(gtab, fit_method=method,
+                                               sigma=sigma)
+    
+            if method == "robust":
+                for linear in [True, False]:
+                    tensor_model = dti.TensorModel(gtab, fit_method=method, linear=linear)
+
+            if method == "retwiq":
+                for linear in [True, False]:
+                    tensor_model = dti.TensorModel(gtab, fit_method=method, linear=linear)
+
+            tensor_est = tensor_model.fit(this_y)
+            npt.assert_equal(tensor_est.model.extra["robust"].shape, Y.shape)
+
+

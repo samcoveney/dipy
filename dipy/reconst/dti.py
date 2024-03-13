@@ -841,6 +841,8 @@ class TensorModel(ReconstModel):
             if extra is not None:
                 for key in extra:
                     self.extra[key] = extra[key].reshape(data.shape)
+            else:
+                self.extra = None
         else:
             dti_params = np.zeros(data.shape[:-1] + (12,))
             dti_params[mask, :] = params_in_mask
@@ -851,6 +853,8 @@ class TensorModel(ReconstModel):
                 for key in extra:
                     self.extra[key] = np.zeros(data.shape)
                     self.extra[key][mask, :] = extra[key]
+            else:
+                self.extra = None
 
         return TensorFit(self, dti_params, model_S0=S0_params)
 
@@ -1466,7 +1470,6 @@ def wls_fit_tensor(design_matrix, data, return_S0_hat=False,
         #print("fit results:", fit_result.shape)
         #print("des mat:", design_matrix.shape)
         leverages = np.einsum('ij,...ji->...i', design_matrix, tmp)
-        #print(leverages.sum(axis=1))  # add up to 7, seem fine
 
     if leverages is not None:
         leverages = {"leverages": leverages}
@@ -1543,7 +1546,9 @@ def ols_fit_tensor(design_matrix, data, return_S0_hat=False,
         fit_result = np.einsum('...ij,...j', tmp, np.log(data))
         leverages = np.einsum('ij,ji->i', design_matrix, tmp)
 
-    leverages = {"leverages": leverages}
+    if leverages is not None:
+        leverages = {"leverages": leverages}
+
     if return_lower_triangular:
         return fit_result, leverages
 
@@ -1803,7 +1808,7 @@ def nlls_fit_tensor(design_matrix, data, weighting=None,
     params = np.empty((flat_data.shape[0], npa))
 
     # For warnings
-    resort_to_OLS = False
+    resort_to_linear = False
 
     # Instance of _NllsHelper, need for nlls error func and jacobian
     nlls = _NllsHelper()
@@ -1842,7 +1847,7 @@ def nlls_fit_tensor(design_matrix, data, weighting=None,
         # If leastsq failed to converge and produced nans, we'll resort to the
         # OLS solution in this voxel:
         except (np.linalg.LinAlgError, TypeError) as e:
-            resort_to_OLS = True
+            resort_to_linear = True
             this_param = start_params
 
             if not fail_is_nan:
@@ -1862,7 +1867,7 @@ def nlls_fit_tensor(design_matrix, data, weighting=None,
             md2 = evals.mean(0) ** 2
             params[vox, 12:] = this_param[6:-1] / md2
 
-    if resort_to_OLS:
+    if resort_to_linear:
         warnings.warn(ols_resort_msg, UserWarning)
 
     params.shape = data.shape[:-1] + (npa,)
@@ -1945,7 +1950,7 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
     robust = np.ones(flat_data.shape, dtype=int)
 
     # For warnings
-    resort_to_OLS = False
+    resort_to_linear = False
 
     # Instance of _NllsHelper, need for nlls error func and jacobian
     nlls = _NllsHelper()
@@ -2081,7 +2086,7 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
             md2 = evals.mean(0) ** 2
             params[vox, 12:] = this_param[6:-1] / md2
 
-    if resort_to_OLS:
+    if resort_to_linear:
         warnings.warn(ols_resort_msg, UserWarning)
 
     params.shape = data.shape[:-1] + (npa,)
@@ -2106,6 +2111,9 @@ def robust_fit_tensor(design_matrix, data, jac=True,
     # 5 due to diffusion tensor conversion to eigenvalue and eigenvectors
     p = design_matrix.shape[-1]
     N = data.shape[-1]
+
+    if N <= p:
+        raise ValueError("Fewer data points than parameters.")
 
     # condition for doing robust estimation
     lc = 1 - 3 * np.sqrt(2 / (N - p))            
@@ -2253,7 +2261,10 @@ def robust_fit_tensor(design_matrix, data, jac=True,
                 # NOTE: we could calculate leverages for WLS in both cases, and translate through to sigma for NL case
                 if not(linear): w = np.sqrt(gmm_l)  # robust WLS weights in both cases
                 HAT = np.dot(design_matrix, (np.linalg.pinv(design_matrix * w[..., None]) * w[..., None].T))
-                HAT_factor = np.sqrt(1 - np.diag(HAT))
+                leverages = np.diag(HAT).copy()
+                # NOTE: should account here for possibilty of HAT being 1 in some cases (in which case residual will be zero)
+                leverages[np.isclose(leverages, 1.0)] = 0.9999
+                HAT_factor = np.sqrt(1 - leverages)
 
                 # conditions for detecting outliers
                 cond_a = (residuals > +cutoff*C*HAT_factor) | (log_residuals < -cutoff*C*HAT_factor/pred_sig)
@@ -2311,7 +2322,7 @@ def robust_fit_tensor(design_matrix, data, jac=True,
         except (np.linalg.LinAlgError, TypeError) as e:
             resort_to_linear = True
             this_param = ols_params[vox]
-            params_flat[vox] = this_param  # NOTE: still need a value for the adjacency loop
+            params_flat[vox] = this_param
 
             if not fail_is_nan:
                 # Convert diffusion tensor parameters to evals and evecs:
@@ -2356,6 +2367,9 @@ def retwiq_fit_tensor(design_matrix, data, jac=True,
     # 5 due to diffusion tensor conversion to eigenvalue and eigenvectors
     p = design_matrix.shape[-1]
     N = data.shape[-1]
+
+    if N <= p:
+        raise ValueError("Fewer data points than parameters.")
 
     # Detect if number of parameters corresponds to dti
     npa = p + 5
@@ -2407,6 +2421,7 @@ def retwiq_fit_tensor(design_matrix, data, jac=True,
         PRED_all = np.exp(LOGP_all)
 
         # leverages from initial OLS/WLS fit for adx = 0, then for 1/RMSE reweighting for adx > 0
+        leverages[np.isclose(leverages, 1.0)] = 0.9999
         HAT_factor_all = np.sqrt(1 - leverages)
 
         # if using all voxels, only need a single RMSE calculation
@@ -2597,7 +2612,12 @@ def retwiq_fit_tensor(design_matrix, data, jac=True,
                     clean_design = design_matrix
                     clean_data = flat_data[vox]
                     RMSE_clean = RMSE
-                    
+                
+                # in cases of zero error (e.g. DTI with single b=0 observation, multiple b=450)
+                test_zero = (RMSE_clean == 0)
+                if np.any(test_zero):
+                    valid_min = RMSE_clean[test_zero == False].min()
+                    RMSE_clean[test_zero] = valid_min
 
                 # final fit with  w = 1 / sigma^2 weights for r^2, with sigma := RMSE of patch (sigma for non-linear space)
                 if not(linear):  # calculate leverages now
@@ -2635,6 +2655,8 @@ def retwiq_fit_tensor(design_matrix, data, jac=True,
                 params_flat_2[vox, :] = this_param
 
             except:  # if something failed, just set to params_flat
+                resort_to_linear = True  # NOTE: this is not quite what's happening, rename the variable, or remove
+                # NOTE: we can't have fail is NaN here, really, unless we record failings and set to NaN later, which also seems silly
                 params_flat_2[vox, :] = params_flat[vox, :]
 
 
