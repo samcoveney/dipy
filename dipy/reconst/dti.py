@@ -1307,7 +1307,7 @@ def iter_fit_tensor(step=1e4):
         """
 
         @functools.wraps(fit_tensor)
-        def wrapped_fit_tensor(design_matrix, data, return_S0_hat=False,
+        def wrapped_fit_tensor(design_matrix, data, weights=None, return_S0_hat=False,
                                step=step, *args, **kwargs):
             """Iterate fit_tensor function over the data chunks
 
@@ -1319,6 +1319,7 @@ def iter_fit_tensor(step=1e4):
             data : array ([X, Y, Z, ...], g)
                 Data or response variables holding the data. Note that the last
                 dimension should contain the data. It makes no copies of data.
+            weights : TODO!!!!!!!!!!!!
             return_S0_hat : bool
                 Boolean to return (True) or not (False) the S0 values for the
                 fit.
@@ -1334,10 +1335,12 @@ def iter_fit_tensor(step=1e4):
             size = np.prod(shape)
             step = int(step) or size
             if step >= size:
-                return fit_tensor(design_matrix, data,
+                return fit_tensor(design_matrix, data, weights=weights,
                                   return_S0_hat=return_S0_hat,
                                   *args, **kwargs)
             data = data.reshape(-1, data.shape[-1])
+            if weights is not None:
+                weights = weights.reshape(-1, weights.shape[-1])
             # NOTE: code to make things work with DKI as well
             if design_matrix.shape[-1] == 22: # DKI
                 sz = 22
@@ -1348,16 +1351,19 @@ def iter_fit_tensor(step=1e4):
                 S0params = np.empty(size, dtype=np.float64)
             extra = {}
             for i in range(0, size, step):
+                w = weights[i:i + step] if weights is not None else None
                 if return_S0_hat:
                     (dtiparams[i:i + step], S0params[i:i + step]), extra_i\
                         = fit_tensor(design_matrix,
                                      data[i:i + step],
+                                     weights=w,
                                      return_S0_hat=return_S0_hat,
                                      *args, **kwargs)
                 else:
                     dtiparams[i:i + step], extra_i\
                         = fit_tensor(design_matrix,
                                      data[i:i + step],
+                                     weights=w,
                                      *args, **kwargs)
 
                 if extra_i is not None:
@@ -1383,7 +1389,7 @@ def iter_fit_tensor(step=1e4):
 
 
 @iter_fit_tensor()
-def wls_fit_tensor(design_matrix, data, return_S0_hat=False,
+def wls_fit_tensor(design_matrix, data, weights=None, return_S0_hat=False,
                    return_lower_triangular=False, return_leverages=False):
     r"""
     Computes weighted least squares (WLS) fit to calculate self-diffusion
@@ -1397,6 +1403,7 @@ def wls_fit_tensor(design_matrix, data, return_S0_hat=False,
     data : array ([X, Y, Z, ...], g)
         Data or response variables holding the data. Note that the last
         dimension should contain the data. It makes no copies of data.
+    weights : TODO !!!!!!!!!!!!!!!!!!!
     return_S0_hat : bool
         Boolean to return (True) or not (False) the S0 values for the fit.
     return_lower_triangular : bool
@@ -1451,10 +1458,12 @@ def wls_fit_tensor(design_matrix, data, return_S0_hat=False,
     data = np.asarray(data)
     log_s = np.log(data)
 
-    # calculate weights
-    fit_result, _ = ols_fit_tensor(design_matrix, data,
-                                   return_lower_triangular=True)
-    w = np.exp(fit_result @ design_matrix.T)
+    if weights is None: # calculate weights
+        fit_result, _ = ols_fit_tensor(design_matrix, data,
+                                       return_lower_triangular=True)
+        w = np.exp(fit_result @ design_matrix.T)
+    else:
+        w = np.sqrt(weights)  # NOTE: important, if passing in weights, ensure they correspond to R^2
 
     # the weighted problem design_matrix * w is much larger (differs per voxel)
     if return_leverages == False:
@@ -1464,11 +1473,7 @@ def wls_fit_tensor(design_matrix, data, return_S0_hat=False,
         leverages = None
     else:
         tmp = np.einsum('...ij,...j->...ij', np.linalg.pinv(design_matrix * w[..., None]), w)  # NOTE: weight on end here 
-        #print("tmp:", tmp.shape)
-        #tmp = np.linalg.pinv(design_matrix * w[..., None]) * w  # NOTE: weight on end here 
         fit_result = np.einsum('...ij,...j', tmp, log_s)
-        #print("fit results:", fit_result.shape)
-        #print("des mat:", design_matrix.shape)
         leverages = np.einsum('ij,...ji->...i', design_matrix, tmp)
 
     if leverages is not None:
@@ -1487,7 +1492,7 @@ def wls_fit_tensor(design_matrix, data, return_S0_hat=False,
 
 
 @iter_fit_tensor()
-def ols_fit_tensor(design_matrix, data, return_S0_hat=False,
+def ols_fit_tensor(design_matrix, data, weights=None, return_S0_hat=False,
                    return_lower_triangular=False, return_leverages=False):
     r"""
     Computes ordinary least squares (OLS) fit to calculate self-diffusion
@@ -1585,7 +1590,7 @@ class _NllsHelper():
     r"""Class with member functions to return nlls error and derivative.
     """
 
-    def err_func(self, tensor, design_matrix, data, weighting=None, sigma=None):
+    def err_func(self, tensor, design_matrix, data, weights=None):
         r"""
         Error function for the non-linear least-squares fit of the tensor.
 
@@ -1600,16 +1605,7 @@ class _NllsHelper():
         data : array
             The voxel signal in all gradient directions
 
-        weighting : str (optional).
-             Whether to use the Geman-McClure weighting criterion (see [1]_
-             for details)
-
-        sigma : float, array (optional)
-            If 'sigma' weighting is used, we will weight the error function
-            according to 1/sigma^2. If 'gmm', the Geman-Mclure
-            M-estimator is used for weighting, in which case this value
-            should be C (see below).
-            FIXME: wrong! should now be C^2 / (C^2 + resid^2)^2
+        weights : TODO !!!!!!!!!!!!!!!!!!!
 
         Notes
         -----
@@ -1643,41 +1639,23 @@ class _NllsHelper():
         # Compute the residuals
         residuals = data - y
 
-        # If we don't want to weight the residuals, we are basically done:
-        if weighting is None:
+        # Set weights
+        if weights is None:
             self.sqrt_w = 1  # cache weights for the *non-squared* residuals
             # And we return the SSE:
             return residuals
-
-        if weighting == 'sigma':
-            if sigma is None:
-                e_s = "Must provide sigma float / array as input to use this weighting"
-                e_s += " method"
-                raise ValueError(e_s)
-            w = 1 / (sigma**2)
-
-        elif weighting == 'gmm':
-            # We use the Geman-McClure M-estimator to compute the weights
-            if sigma is None:
-                e_s = "Must provide Geman-McClure M-estimator weights for"
-                e_s += " squared residuals as sigma values to use this"
-                e_s += " weighting method"
-                raise ValueError(e_s)
+        else:
+            # Return the weighted residuals:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                w = sigma
+                self.sqrt_w = np.sqrt(weights)
+                ans = self.sqrt_w * residuals
+                if np.iterable(weights):
+                    # cache the weights for the *non-squared* residuals
+                    self.sqrt_w = self.sqrt_w[:, None]
+                return ans
 
-        # Return the weighted residuals:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.sqrt_w = np.sqrt(w)
-            ans = self.sqrt_w * residuals
-            if np.iterable(w):
-                # cache the weights for the *non-squared* residuals
-                self.sqrt_w = np.sqrt(w)[:, None]
-            return ans
-
-    def jacobian_func(self, tensor, design_matrix, data, weighting=None, sigma=None):
+    def jacobian_func(self, tensor, design_matrix, data, weights=None):
         """The Jacobian is the first derivative of the error function [1]_.
 
         Notes
@@ -1694,7 +1672,7 @@ class _NllsHelper():
         # minus sign, because derivative of residuals = data - y
         # sqrt(w) because w corresponds to the squared residuals
 
-        if weighting is None:
+        if weights is None:
             return -self.y[:, None] * design_matrix
         else:
             return -self.y[:, None] * design_matrix * self.sqrt_w
@@ -1745,8 +1723,8 @@ def _decompose_tensor_nan(tensor, tensor_alternative, min_diffusivity=0):
     return evals, evecs
 
 
-def nlls_fit_tensor(design_matrix, data, weighting=None,
-                    sigma=None, jac=True, return_S0_hat=False,
+def nlls_fit_tensor(design_matrix, data, weights=None,
+                    jac=True, return_S0_hat=False,
                     fail_is_nan=False):
     """
     Fit the cumulant expansion params (e.g. DTI, DKI) using non-linear
@@ -1764,15 +1742,7 @@ def nlls_fit_tensor(design_matrix, data, weighting=None,
         Data or response variables holding the data. Note that the last
         dimension should contain the data. It makes no copies of data.
 
-    weighting: str
-           the weighting scheme to use in considering the
-           squared-error. Default behavior is to use uniform weighting. Other
-           options: 'sigma' 'gmm'
-
-    sigma : array (optional)
-        If 'sigma' weighting is used, we will weight the error function
-        according to 1/sigma^2. If 'gmm', the Geman-Mclure
-        M-estimator is used for weighting (see below).
+    weights : TODO !!!!!!!!!!!!!!!!!!!
 
     jac : bool
         Use the Jacobian? Default: True
@@ -1828,15 +1798,14 @@ def nlls_fit_tensor(design_matrix, data, weighting=None,
                 this_param, status = opt.leastsq(nlls.err_func, start_params,
                                                  args=(design_matrix,
                                                        flat_data[vox],
-                                                       weighting,
-                                                       sigma),
+                                                       weights),
                                                  Dfun=nlls.jacobian_func)
             else:
                 this_param, status = opt.leastsq(nlls.err_func, start_params,
                                                  args=(design_matrix,
                                                        flat_data[vox],
-                                                       weighting,
-                                                       sigma))
+                                                       weights),
+                                                       )
 
             # Convert diffusion tensor parameters to the evals and the evecs:
             evals, evecs = decompose_tensor(
@@ -1876,6 +1845,149 @@ def nlls_fit_tensor(design_matrix, data, weighting=None,
         return [params, model_S0], None
     else:
         return params, None
+
+
+def weight_method_gmm(data, design_matrix, params):
+
+
+
+def robust_fit_wrapper(design_matrix, data, jac=True,
+                       return_S0_hat=False,
+                       cutoff=3,
+                       adjacency=None,
+                       weight_method=None):  # NOTE: is this really allowed to be None?
+    """
+    NOTE: this is only designed to work with WLS, but it should allow to use weights of our choice.
+          i.e. it should allow GMM, any other robust weighting once I code it, and RETWIQ.
+    """
+
+    # Detect number of parameters to estimate from design_matrix length plus
+    # 5 due to diffusion tensor conversion to eigenvalue and eigenvectors
+    p = design_matrix.shape[-1]
+    N = data.shape[-1]
+    if N <= p: raise ValueError("Fewer data points than parameters.")
+    factor = 1.4826 * np.sqrt(N / (N - p))
+
+    # Detect if number of parameters corresponds to dti
+    npa = p + 5
+    dti = (npa == 12)
+
+    # log data
+    #log_data = np.log(data)
+
+    # For storing whether image is used in final fit for each voxel
+    robust = np.ones(data.shape, dtype=int) # FIXME: weight_method should also be responsible for defining this?
+
+    # loop over the methods
+    for rdx in range(1, 11):
+
+        if rdx == 1:
+            w = None
+        else:
+
+            # ideas:
+            # pass in a function that returns the desired weights? Must take in a standard set of stuff...
+            # But how to use adjacency? Pass a function that belongs to a class for which adjacency is already defined?
+
+            weight_method = weight_method_gmm  # set like this for now
+            w = weight_method(data, design_matrix, D)
+
+            # calculate quantities needed for C and w
+            log_pred_sig = np.dot(design_matrix, D.T).T
+            pred_sig = np.exp(log_pred_sig)
+            residuals = data - pred_sig
+            log_data = np.log(data)  # Waste to recalc, but I want to hand things to 'weight_method'
+            log_residuals = log_data - log_pred_sig
+            z = pred_sig * log_residuals
+
+            if False: # M-estimator, needs an option
+                # NOTE: we may be able to use adjacency for this C, even if not using RETWIQ! would be a nice option
+                C = factor * np.median(np.abs(z - np.median(z, axis=-1)[:, None]), axis=-1)[:, None]  # NOTE: IRLS eq9 correction
+                w = (C/pred_sig)**2 / ((C/pred_sig)**2 + log_residuals**2)**2
+
+            else: # RETWIQ method, which can use all voxels or some voxels, depending on if we pass in adjacency
+                # NOTE: for RETWIQ, I use HAT_factor in the weights
+                leverages[np.isclose(leverages, 1.0)] = 0.9999
+                HAT_factor_all = np.sqrt(1 - leverages)
+
+                if adjacency is not None: # RETWIQ had an 'all voxels' and 'subset voxels' option, needs building in here
+                    w = np.zeros_like(data)
+                    C = np.zeros((data.shape[0:-1] + (1,)))
+                    for vox in range(len(adjacency)):
+                        LOGP = log_pred_sig[adjacency[vox]]
+                        PRED = pred_sig[adjacency[vox]]
+                        LOGY = log_data[adjacency[vox]]
+                        Y = data[adjacency[vox]]
+                        HAT_factor = HAT_factor_all[adjacency[vox]]
+
+                        # calculate C from all adjacent voxels 
+                        residuals_vox = (Y - PRED)
+                        # FIXME: this is part of the outliers used on the last iteration, come back to this
+                        # Issue
+                        if rdx == 10: #patch_outliers and adx == patch_iter - 1:
+                            log_residuals_vox = (LOGY - LOGP)
+                            z = PRED * log_residuals_vox
+                            C[vox] = factor * np.median(np.abs(z - np.median(z)))  # NOTE: IRLS eq9 correction
+
+                        # calculate RMSE = sigma, for 1/sigma^2 weighting of residuals^2 - sigma is error stdev in *non-linear* space
+                        yy = residuals_vox / HAT_factor
+                        MSE = (yy**2).mean(axis=0)
+                        w[vox] = 1.0 / MSE
+                    #RMSE = np.sqrt(MSE)
+            
+            # TODO: do NOT combine over voxels, separate over voxels - gives opportunity to smooth! Although calculating it from the residuals in a local area is better.. but then need a loop?
+            #print("C:", C)
+
+            if rdx == 10: # and False:  # last iteration - could do AFTER last iteration, rather than in... but we will test
+                # TODO: C[vox] needs calculating for RETWIQ
+                # conditions for detecting outliers
+                leverages[np.isclose(leverages, 1.0)] = 0.9999
+                HAT_factor = np.sqrt(1 - leverages)
+                cond_a = (residuals > +cutoff*C*HAT_factor) | (log_residuals < -cutoff*C*HAT_factor/pred_sig)
+                cond_b = (log_residuals > +cutoff*C*HAT_factor/pred_sig) | (residuals < -cutoff*C*HAT_factor)
+                cond = cond_a | cond_b
+                robust = (cond == False)
+
+                if True:
+                    # multivariate outlier condition
+                    # ------------------------------
+                    for vox in range(len(adjacency)):
+                        # FIXME: we have saved w = 1 / MSE, so... each row is w[vox] = 1 / MSE[vox]... so I need to do this per voxel... maybe put into the loop above for RETWIQ...
+                        RMSE = 1./np.sqrt(w[vox])
+                        MED = np.median(RMSE)
+                        MAD = np.median(np.abs(RMSE - MED))
+                        MAD = MAD * 1.4826
+                        MV_cutoff = 3  # hard-wired...
+                        MV_cond = (RMSE > (MED + MV_cutoff*MAD)) | (RMSE < (MED - MV_cutoff*MAD))
+                        robust[vox, MV_cond] = 0
+
+                # use this to define outliers
+                w[robust==0] = 0.0
+                w[robust==1] = 1.0  # NOTE: this will depend on the method... RETWIQ leave weights on .... could do same for GMM if we wish
+
+        # calculate WLS solution
+        D, extra = wls_fit_tensor(design_matrix, data, weights=w, return_lower_triangular=True, return_leverages=True)
+        leverages = extra["leverages"] # FIXME: I think we will need this
+
+    # Convert diffusion tensor parameters to the evals and the evecs:
+    evals, evecs = decompose_tensor(
+        from_lower_triangular(D[:, :6]))
+    params = np.empty((data.shape[0:-1] + (npa,)))  # NOTE: move up?
+    params[:, :3] = evals
+    params[:, 3:12] = evecs.reshape(params.shape[0:-1] + (-1,))
+
+    if return_S0_hat:
+        model_S0 = np.exp(-D[:, -1])
+    if not dti:
+        md2 = evals.mean(0) ** 2
+        params[:, 12:] = params[:, 6:-1] / md2
+
+    extra = {"robust": robust}
+    if return_S0_hat:
+        model_S0.shape = data.shape[:-1] + (1,)
+        return [params, model_S0], extra
+    else:
+        return params, extra
 
 
 def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
@@ -2900,5 +3012,6 @@ common_fit_methods = {'WLS': wls_fit_tensor,
                       'robust': robust_fit_tensor,
                       'ROBUST': robust_fit_tensor,
                       'retwiq': retwiq_fit_tensor,
-                      'RETWIQ': retwiq_fit_tensor
+                      'RETWIQ': retwiq_fit_tensor,
+                      'idea': robust_fit_wrapper
                       }
