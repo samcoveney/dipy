@@ -762,7 +762,7 @@ class TensorModel(ReconstModel):
             raise ValueError(e_s)
         self.extra = {}
 
-    def fit(self, data, mask=None, adjacency=False):
+    def fit(self, data, mask=None): # FIXME: remove, if another way works out... adjacency=False, weight_method=None):
         """ Fit method of the DTI model class
 
         Parameters
@@ -789,9 +789,9 @@ class TensorModel(ReconstModel):
             mask = np.array(mask, dtype=bool, copy=False)
         data_in_mask = np.reshape(data[mask], (-1, data.shape[-1]))
 
-        if adjacency > 0:
-            self.kwargs["adjacency"] = adjacency_calc(img_shape, mask,
-                                                      adjacency)
+#        if adjacency > 0: # FIXME: remove, if it's better for user to supply the adjacency_calc results as keyword arg to TensorModel
+#            self.kwargs["adjacency"] = adjacency_calc(img_shape, mask,
+#                                                      adjacency)
 
         if "sigma" in self.kwargs:
             sigma = self.kwargs["sigma"]
@@ -1847,15 +1847,70 @@ def nlls_fit_tensor(design_matrix, data, weights=None,
         return params, None
 
 
-def weight_method_gmm(data, design_matrix, params):
+def weight_method_gmm(data, design_matrix, params, leverages, idx, total_idx): #, adjacency=None):
+    """
+    Aim is to have the user supply these, in theory, but we can have some defaults.
+    """
+
+    cutoff = 3 # could be an input
+
+    # calculate quantities needed for C and w
+    log_pred_sig = np.dot(design_matrix, params.T).T
+    pred_sig = np.exp(log_pred_sig)
+    residuals = data - pred_sig
+    log_data = np.log(data)  # Waste to recalc, but I want to hand things to 'weight_method'
+    log_residuals = log_data - log_pred_sig
+    z = pred_sig * log_residuals
+
+    p = design_matrix.shape[-1]
+    N = data.shape[-1]
+    if N <= p: raise ValueError("Fewer data points than parameters.")
+    factor = 1.4826 * np.sqrt(N / (N - p))
 
 
+    # TODO: iteration count shuold be arguments
+    # for WLS, need to do some unweighted fits after outlier rejection to estimate S, then do final weighted, otherwise using pred_S from the GMM weights in final fit...
+    # problem is that I am using the weights to switch the outliers on and off... so I can't easily do a 'clean' OLS fit to estimate predS...
+    # however! I could do a 'clean' OLS fit using w = 0 or 1 for a WLS fit! And THEN estimate predS, and THEN do the final WLS. That will work
+    # only way would be to modify the function, so on last iter, it fits only where w > 0 (or, say, not NaN), but that it different per voxel...
 
-def robust_fit_wrapper(design_matrix, data, jac=True,
-                       return_S0_hat=False,
-                       cutoff=3,
-                       adjacency=None,
-                       weight_method=None):  # NOTE: is this really allowed to be None?
+    print(data.shape, design_matrix.shape)
+
+    C = factor * np.median(np.abs(z - np.median(z, axis=-1)[:, None]), axis=-1)[:, None]  # NOTE: IRLS eq9 correction
+    w = (C/pred_sig)**2 / ((C/pred_sig)**2 + log_residuals**2)**2
+    robust = None
+    # NOTE
+    if idx >= total_idx - 1:  # the user should be able to specify things to do on the last iteration
+
+        # NOTE: not sure we want to run this in both the second to last and the last...
+        leverages[np.isclose(leverages, 1.0)] = 0.9999
+        HAT_factor = np.sqrt(1 - leverages)
+        cond_a = (residuals > +cutoff*C*HAT_factor) | (log_residuals < -cutoff*C*HAT_factor/pred_sig)
+        #cond_b = (log_residuals > +cutoff*C*HAT_factor/pred_sig) | (residuals < -cutoff*C*HAT_factor)
+        cond = cond_a #| cond_b
+        robust = (cond == False)
+
+        print(idx, total_idx)
+        if idx == total_idx:
+            print("wls weight")
+            # does wls fit with the wls weights (but without outliers)
+            # in this case, I choose to discard the outliers and unweight the non-outliers
+            w[robust==0] = 0.0
+            w[robust==1] = pred_sig[robust==1]**2  # NOTE: this will depend on the method... RETWIQ leave weights on .... could do same for GMM if we wish
+        else:
+            print("zero weight")
+            # turns the wls fit into OLS but without the outliers
+            # in this case, I choose to discard the outliers and unweight the non-outliers
+            w[robust==0] = 0.0
+            w[robust==1] = 1.0  # NOTE: this will depend on the method... RETWIQ leave weights on .... could do same for GMM if we wish
+
+    return w, robust  # NOTE: could return estimate of noise level, that is a very general thing to want to return for robust fitting
+
+
+def robust_wls_fit_tensor(design_matrix, data, jac=True,
+                          return_S0_hat=False,
+                          weight_method=weight_method_gmm):
+                          # NOTE: iterations should also be an argument
     """
     NOTE: this is only designed to work with WLS, but it should allow to use weights of our choice.
           i.e. it should allow GMM, any other robust weighting once I code it, and RETWIQ.
@@ -1865,122 +1920,46 @@ def robust_fit_wrapper(design_matrix, data, jac=True,
     # 5 due to diffusion tensor conversion to eigenvalue and eigenvectors
     p = design_matrix.shape[-1]
     N = data.shape[-1]
-    if N <= p: raise ValueError("Fewer data points than parameters.")
-    factor = 1.4826 * np.sqrt(N / (N - p))
+    if N <= p:
+        raise ValueError("Fewer data points than parameters.")
 
     # Detect if number of parameters corresponds to dti
+    # NOTE: not sure this will still work with dki
     npa = p + 5
     dti = (npa == 12)
 
-    # log data
-    #log_data = np.log(data)
 
-    # For storing whether image is used in final fit for each voxel
-    robust = np.ones(data.shape, dtype=int) # FIXME: weight_method should also be responsible for defining this?
+    # FIXME: maybe wrong approach
+    if weight_method is None:
+        weight_method = weight_method_gmm
 
     # loop over the methods
-    for rdx in range(1, 11):
+    TDX = 10
+    for rdx in range(1, TDX + 1):  # FIXME: needs to be a user-supplied argument
 
         if rdx == 1:
-            w = None
+            w, robust = None, None
         else:
-
-            # ideas:
-            # pass in a function that returns the desired weights? Must take in a standard set of stuff...
-            # But how to use adjacency? Pass a function that belongs to a class for which adjacency is already defined?
-
-            weight_method = weight_method_gmm  # set like this for now
-            w = weight_method(data, design_matrix, D)
-
-            # calculate quantities needed for C and w
-            log_pred_sig = np.dot(design_matrix, D.T).T
-            pred_sig = np.exp(log_pred_sig)
-            residuals = data - pred_sig
-            log_data = np.log(data)  # Waste to recalc, but I want to hand things to 'weight_method'
-            log_residuals = log_data - log_pred_sig
-            z = pred_sig * log_residuals
-
-            if False: # M-estimator, needs an option
-                # NOTE: we may be able to use adjacency for this C, even if not using RETWIQ! would be a nice option
-                C = factor * np.median(np.abs(z - np.median(z, axis=-1)[:, None]), axis=-1)[:, None]  # NOTE: IRLS eq9 correction
-                w = (C/pred_sig)**2 / ((C/pred_sig)**2 + log_residuals**2)**2
-
-            else: # RETWIQ method, which can use all voxels or some voxels, depending on if we pass in adjacency
-                # NOTE: for RETWIQ, I use HAT_factor in the weights
-                leverages[np.isclose(leverages, 1.0)] = 0.9999
-                HAT_factor_all = np.sqrt(1 - leverages)
-
-                if adjacency is not None: # RETWIQ had an 'all voxels' and 'subset voxels' option, needs building in here
-                    w = np.zeros_like(data)
-                    C = np.zeros((data.shape[0:-1] + (1,)))
-                    for vox in range(len(adjacency)):
-                        LOGP = log_pred_sig[adjacency[vox]]
-                        PRED = pred_sig[adjacency[vox]]
-                        LOGY = log_data[adjacency[vox]]
-                        Y = data[adjacency[vox]]
-                        HAT_factor = HAT_factor_all[adjacency[vox]]
-
-                        # calculate C from all adjacent voxels 
-                        residuals_vox = (Y - PRED)
-                        # FIXME: this is part of the outliers used on the last iteration, come back to this
-                        # Issue
-                        if rdx == 10: #patch_outliers and adx == patch_iter - 1:
-                            log_residuals_vox = (LOGY - LOGP)
-                            z = PRED * log_residuals_vox
-                            C[vox] = factor * np.median(np.abs(z - np.median(z)))  # NOTE: IRLS eq9 correction
-
-                        # calculate RMSE = sigma, for 1/sigma^2 weighting of residuals^2 - sigma is error stdev in *non-linear* space
-                        yy = residuals_vox / HAT_factor
-                        MSE = (yy**2).mean(axis=0)
-                        w[vox] = 1.0 / MSE
-                    #RMSE = np.sqrt(MSE)
-            
-            # TODO: do NOT combine over voxels, separate over voxels - gives opportunity to smooth! Although calculating it from the residuals in a local area is better.. but then need a loop?
-            #print("C:", C)
-
-            if rdx == 10: # and False:  # last iteration - could do AFTER last iteration, rather than in... but we will test
-                # TODO: C[vox] needs calculating for RETWIQ
-                # conditions for detecting outliers
-                leverages[np.isclose(leverages, 1.0)] = 0.9999
-                HAT_factor = np.sqrt(1 - leverages)
-                cond_a = (residuals > +cutoff*C*HAT_factor) | (log_residuals < -cutoff*C*HAT_factor/pred_sig)
-                cond_b = (log_residuals > +cutoff*C*HAT_factor/pred_sig) | (residuals < -cutoff*C*HAT_factor)
-                cond = cond_a | cond_b
-                robust = (cond == False)
-
-                if True:
-                    # multivariate outlier condition
-                    # ------------------------------
-                    for vox in range(len(adjacency)):
-                        # FIXME: we have saved w = 1 / MSE, so... each row is w[vox] = 1 / MSE[vox]... so I need to do this per voxel... maybe put into the loop above for RETWIQ...
-                        RMSE = 1./np.sqrt(w[vox])
-                        MED = np.median(RMSE)
-                        MAD = np.median(np.abs(RMSE - MED))
-                        MAD = MAD * 1.4826
-                        MV_cutoff = 3  # hard-wired...
-                        MV_cond = (RMSE > (MED + MV_cutoff*MAD)) | (RMSE < (MED - MV_cutoff*MAD))
-                        robust[vox, MV_cond] = 0
-
-                # use this to define outliers
-                w[robust==0] = 0.0
-                w[robust==1] = 1.0  # NOTE: this will depend on the method... RETWIQ leave weights on .... could do same for GMM if we wish
+            w, robust = weight_method(data, design_matrix, D, leverages,
+                                      rdx, TDX) # , adjacency=adjacency)
 
         # calculate WLS solution
         D, extra = wls_fit_tensor(design_matrix, data, weights=w, return_lower_triangular=True, return_leverages=True)
-        leverages = extra["leverages"] # FIXME: I think we will need this
+        leverages = extra["leverages"]
 
     # Convert diffusion tensor parameters to the evals and the evecs:
     evals, evecs = decompose_tensor(
         from_lower_triangular(D[:, :6]))
-    params = np.empty((data.shape[0:-1] + (npa,)))  # NOTE: move up?
+    params = np.empty((data.shape[0:-1] + (npa,)))
     params[:, :3] = evals
     params[:, 3:12] = evecs.reshape(params.shape[0:-1] + (-1,))
 
     if return_S0_hat:
         model_S0 = np.exp(-D[:, -1])
-    if not dti:
-        md2 = evals.mean(0) ** 2
-        params[:, 12:] = params[:, 6:-1] / md2
+    if not dti: # FIXME: not sure this will work with DKI at the moment
+        print(evals.shape)
+        md2 = evals.mean(axis=1)[:, None] ** 2  # NOTE: I change from axis 0 to axis 1
+        params[:, 12:] = D[:, 6:-1] / md2 # NOTE: I change from params to D
 
     extra = {"robust": robust}
     if return_S0_hat:
@@ -3013,5 +2992,5 @@ common_fit_methods = {'WLS': wls_fit_tensor,
                       'ROBUST': robust_fit_tensor,
                       'retwiq': retwiq_fit_tensor,
                       'RETWIQ': retwiq_fit_tensor,
-                      'idea': robust_fit_wrapper
+                      'idea': robust_wls_fit_tensor
                       }
