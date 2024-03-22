@@ -1847,7 +1847,8 @@ def nlls_fit_tensor(design_matrix, data, weights=None,
         return params, None
 
 
-def weight_method_gmm(data, design_matrix, params, leverages, idx, total_idx): #, adjacency=None):
+#def weight_method_gmm(data, design_matrix, params, leverages, idx, total_idx): #, adjacency=None):
+def weight_method_gmm(data, pred_sig, design_matrix, leverages, idx, total_idx): #, adjacency=None):
     """
     Aim is to have the user supply these, in theory, but we can have some defaults.
     """
@@ -1855,8 +1856,9 @@ def weight_method_gmm(data, design_matrix, params, leverages, idx, total_idx): #
     cutoff = 3 # could be an input
 
     # calculate quantities needed for C and w
-    log_pred_sig = np.dot(design_matrix, params.T).T
-    pred_sig = np.exp(log_pred_sig)
+    #log_pred_sig = np.dot(design_matrix, params.T).T
+    #pred_sig = np.exp(log_pred_sig)
+    log_pred_sig = np.log(pred_sig) # NOTE: inefficient to recalc but who cares
     residuals = data - pred_sig
     log_data = np.log(data)  # Waste to recalc, but I want to hand things to 'weight_method'
     log_residuals = log_data - log_pred_sig
@@ -1874,23 +1876,32 @@ def weight_method_gmm(data, design_matrix, params, leverages, idx, total_idx): #
     # however! I could do a 'clean' OLS fit using w = 0 or 1 for a WLS fit! And THEN estimate predS, and THEN do the final WLS. That will work
     # only way would be to modify the function, so on last iter, it fits only where w > 0 (or, say, not NaN), but that it different per voxel...
 
-    print(data.shape, design_matrix.shape)
+#    print(data.shape, design_matrix.shape)
+    print(z.shape, pred_sig.shape, data.shape)
 
-    C = factor * np.median(np.abs(z - np.median(z, axis=-1)[:, None]), axis=-1)[:, None]  # NOTE: IRLS eq9 correction
+    C = factor * np.median(np.abs(z - np.median(z, axis=-1)[..., None]), axis=-1)[..., None]  # NOTE: IRLS eq9 correction
     w = (C/pred_sig)**2 / ((C/pred_sig)**2 + log_residuals**2)**2
     robust = None
-    # NOTE
+
+    # NOTE: hack to try to test out stuff - this is the usual weighting for WLS, so in theory answer should be roughly the same?
+#    w = pred_sig**2  # NOTE: this will depend on the method... RETWIQ leave weights on .... could do same for GMM if we wish
+
+
+    # NOTE : turned off for now, trying to test out what is going on
+    #if False:
     if idx >= total_idx - 1:  # the user should be able to specify things to do on the last iteration
 
         # NOTE: not sure we want to run this in both the second to last and the last...
         leverages[np.isclose(leverages, 1.0)] = 0.9999
-        HAT_factor = np.sqrt(1 - leverages)
+        #HAT_factor = np.sqrt(1 - leverages)
+        HAT_factor = 1  # NOTE: hack while testing!!! Needs putting back to normal
         cond_a = (residuals > +cutoff*C*HAT_factor) | (log_residuals < -cutoff*C*HAT_factor/pred_sig)
         #cond_b = (log_residuals > +cutoff*C*HAT_factor/pred_sig) | (residuals < -cutoff*C*HAT_factor)
         cond = cond_a #| cond_b
         robust = (cond == False)
 
         print(idx, total_idx)
+        #print((robust==1)/(robust==1))
         if idx == total_idx:
             print("wls weight")
             # does wls fit with the wls weights (but without outliers)
@@ -1940,8 +1951,10 @@ def robust_wls_fit_tensor(design_matrix, data, jac=True,
         if rdx == 1:
             w, robust = None, None
         else:
-            w, robust = weight_method(data, design_matrix, D, leverages,
-                                      rdx, TDX) # , adjacency=adjacency)
+            #w, robust = weight_method(data, design_matrix, D, leverages, rdx, TDX) # , adjacency=adjacency)
+            log_pred_sig = np.dot(design_matrix, D.T).T
+            pred_sig = np.exp(log_pred_sig)
+            w, robust = weight_method(data, pred_sig, design_matrix, leverages, rdx, TDX) # , adjacency=adjacency)
 
         # calculate WLS solution
         D, extra = wls_fit_tensor(design_matrix, data, weights=w, return_lower_triangular=True, return_leverages=True)

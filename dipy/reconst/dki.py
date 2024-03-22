@@ -1575,6 +1575,12 @@ def dki_prediction(dki_params, gtab, S0=1.):
 
     return pred_sig
 
+# FIXME: placing this weight method up here, out of the class... for now
+from dipy.reconst.dti import weight_method_gmm # FIXME: move this later, once the method is relocated 
+def weight_method_test(data, pred_sig, design_matrix, leverages, idx, total_idx):
+    # so... now we need a weight function...
+    weights = np.ones_like(data) * 1.0
+    return weights, None
 
 class DiffusionKurtosisModel(ReconstModel):
     """ Class for the Diffusion Kurtosis Model
@@ -1677,8 +1683,14 @@ class DiffusionKurtosisModel(ReconstModel):
         # Combine with the fact that 'fit' is also currently wrong
         # (although I may have fixed it with my additions...)
         # this may explain everything
-        self.is_multi_method = fit_method in ['WLS', 'OLS', 'UWLLS', 'ULLS',
-                                              'WLLS', 'OLLS', 'CLS', 'CWLS']#, 'idea2']
+        if False:
+            self.is_multi_method = fit_method in ['WLS', 'OLS', 'UWLLS', 'ULLS',
+                                                  'WLLS', 'OLLS', 'CLS', 'CWLS']
+            self.is_robust_method = fit_method in []  # NOTE: can test using 'WLS' for now, to build my wrapper properly...
+        else:
+            self.is_multi_method = fit_method in ['OLS', 'UWLLS', 'ULLS', # FIXME : removed WLS for testing
+                                                  'WLLS', 'OLLS', 'CLS']
+            self.is_robust_method = fit_method in ['WLS', 'CWLS']  # NOTE: can test using 'WLS' for now, to build my wrapper properly...
 
     # FIXME: fit might be broken now, inverse_design_matrix is a keyword but isn't getting passed? And *self.args is after return_S0_hat
     def fit(self, data, mask=None):
@@ -1696,6 +1708,8 @@ class DiffusionKurtosisModel(ReconstModel):
         data_thres = np.maximum(data, self.min_signal)
         if self.is_multi_method:
             return self.multi_fit(data_thres, mask=mask)
+        if self.is_robust_method:  # NOTE: NEW idea : could put the robust iteration loop here and loop over multi_fit, or call new robust_fit that does this for us...
+            return self.robust_fit(data_thres, mask=mask)
 
         S0_params = None
         if data.ndim == 1:
@@ -1740,15 +1754,22 @@ class DiffusionKurtosisModel(ReconstModel):
         return DiffusionKurtosisFit(self, dki_params, model_S0=S0_params)
 
     @multi_voxel_fit
-    def multi_fit(self, data_thres, mask=None):
+    def multi_fit(self, data_thres, mask=None, weights=True):  # NOTE: add weights=True
         extra_args = {} if not self.convexity_constraint else {
             'cvxpy_solver': self.cvxpy_solver,
             'sdp': self.sdp,
             }
+        # FIXME: so... now, self. weights would need to be allowed to be an array for each voxel
+        # so multi_fit would need to be able to pass the specific value of the weights
+        # so it would need to be an argument to multi_fit...
+        # NOTE: currently, I am defining the weight ARRAY inside of multi_voxel_fit, so this routine here obtains the correct values
+        #       the question is, where should the actual weights, defined from the fitting residuals, actuall get defined?
+
         params, extra = self.fit_method(self.design_matrix, data_thres,
                                         self.inverse_design_matrix,
                                         return_S0_hat=self.return_S0_hat,
-                                        weights=self.weights,
+                                        #weights=self.weights,
+                                        weights=weights,  # NOTE: not using self.weights, but values passed in - may need to SET self.weights to be the values I want as a way to do it
                                         min_diffusivity=self.min_diffusivity,
                                         **extra_args)
 
@@ -1757,6 +1778,33 @@ class DiffusionKurtosisModel(ReconstModel):
             params, S0_params = params
 
         return DiffusionKurtosisFit(self, params, model_S0=S0_params)
+
+    def robust_fit(self, data_thres, mask=None, weight_method=weight_method_gmm):  # FIXME: would need to utilize 'weight method' I think
+        TDX = 10
+        for rdx in range(1, TDX+1):
+            print("rdx:", rdx)
+
+            if rdx == 1:
+                w, robust = True, None
+            else:
+                # make prediction of the signal
+                pred_sig = self.predict(tmp.model_params, S0=tmp.model_S0)
+                leverages = np.ones_like(data_thres, dtype=np.float64) # FIXME: hacking the leverages for now, they are not even that important
+                w, robust = weight_method(data_thres, pred_sig, self.design_matrix, leverages=leverages, idx=rdx, total_idx=TDX)
+
+                # TODO: now, just need to pass the appropriate info to this function (or to weights_method_gmm), and the weights should work!
+                #w, robust = weight_method(data_thres, self.design_matrix, params=None, leverages=None,
+                #                          idx=rdx, total_idx=TDX) # , adjacency=adjacency)
+
+            # so... now we need a weight function...
+            #weights = np.ones_like(data_thres) * 1.2345
+
+            tmp = self.multi_fit(data_thres, mask=mask, weights=w)
+
+            #import IPython as ipy
+            #ipy.embed()
+
+        return tmp
 
     def predict(self, dki_params, S0=1.):
         """ Predict a signal for this DKI model class instance given parameters
@@ -2258,7 +2306,6 @@ def params_to_dki_params(result, min_diffusivity=0):
     return dki_params
 
 
-from dipy.reconst.dti import weight_method_gmm # FIXME: move this later, once the method is relocated 
 #def cls_fit_dki(design_matrix, data, inverse_design_matrix, sdp,
 #                return_S0_hat=False, weights=True,
 #                min_diffusivity=0, cvxpy_solver=None):
@@ -2362,10 +2409,9 @@ def ls_fit_dki(design_matrix, data, inverse_design_matrix,
     A = design_matrix
     y = np.log(data)
 
-    print(weights)
     if weights is not False:
-        if type(weights) is np.ndarray: # use supplied weights
-            W = weights 
+        if type(weights) is np.ndarray: # user supplied weights
+            W = np.diag(weights)
         else: # Define weights as diag(yn**2)
             # DKI ordinary linear least square solution
             result = np.dot(inverse_design_matrix, y)
@@ -2457,7 +2503,7 @@ def cls_fit_dki(design_matrix, data, inverse_design_matrix, sdp,
 
     if weights is not False:
         if type(weights) is np.ndarray: # use supplied weights
-            W = weights 
+            W = np.diag(np.sqrt(weights))  # NOTE: we may need sqrt(weights!) because of how they are incorporated!
         else: # Define weights as diag(yn**2)
             # DKI ordinary linear least square solution
             result = np.dot(inverse_design_matrix, y)
@@ -2473,7 +2519,8 @@ def cls_fit_dki(design_matrix, data, inverse_design_matrix, sdp,
     if return_leverages == False:
         leverages = None
     else:
-        leverage = result.shape[1] * np.ones_like(data.shape[0]) / data.shape[0]
+        #leverages = result.shape[1] * np.ones_like(data.shape[0]) / data.shape[0]
+        leverages = np.ones_like(data.shape[0])
 
     if leverages is not None:
         leverages = {"leverages": leverages}

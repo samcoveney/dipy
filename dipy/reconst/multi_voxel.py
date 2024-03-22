@@ -12,7 +12,7 @@ def multi_voxel_fit(single_voxel_fit):
     """Method decorator to turn a single voxel model fit
     definition into a multi voxel model fit definition
     """
-    def new_fit(self, data, mask=None):
+    def new_fit(self, data, mask=None, weights=True): # NOTE: added weights=True as default
         """Fit method for every voxel in data"""
         # If only one voxel just return a normal fit
         if data.ndim == 1:
@@ -27,12 +27,24 @@ def multi_voxel_fit(single_voxel_fit):
         elif mask.shape != data.shape[:-1]:
             raise ValueError("mask and data shape do not match")
 
+#        # NOTE: new, try to generalize weights
+#        if type(weights) is not np.ndarray:  # user supplied weights
+#            print("running this")
+#            weights = np.ones(data.shape[0], dtype=bool)
+#
+        #print("inside MV")
+
+
         # Fit data where mask is True
         fit_array = np.empty(data.shape[:-1], dtype=object)
         bar = tqdm(total=np.sum(mask), position=0)
         for ijk in ndindex(data.shape[:-1]):
             if mask[ijk]:
-                fit_array[ijk] = single_voxel_fit(self, data[ijk])
+                if type(weights) is np.ndarray:  # user supplied weights
+                    #print("in MV", weights[ijk])
+                    fit_array[ijk] = single_voxel_fit(self, data[ijk], weights=weights[ijk])  # NOTE: pass appropriate weights element
+                else:
+                    fit_array[ijk] = single_voxel_fit(self, data[ijk], weights)  # NOTE: pass appropriate weights element
                 bar.update()
         bar.close()
         return MultiVoxelFit(self, fit_array, mask)
