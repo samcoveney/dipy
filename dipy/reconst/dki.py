@@ -1709,7 +1709,8 @@ class DiffusionKurtosisModel(ReconstModel):
         if self.is_multi_method:
             return self.multi_fit(data_thres, mask=mask)
         if self.is_robust_method:  # NOTE: NEW idea : could put the robust iteration loop here and loop over multi_fit, or call new robust_fit that does this for us...
-            return self.robust_fit(data_thres, mask=mask)
+            #return self.robust_fit(data_thres, mask=mask)  # FIXME: weight method maybe need here?
+            return self.robust_fit(data_thres, mask=mask, weight_method=self.kwargs["weight_method"])  # FIXME: weight method maybe need here?
 
         S0_params = None
         if data.ndim == 1:
@@ -1790,7 +1791,8 @@ class DiffusionKurtosisModel(ReconstModel):
                 # make prediction of the signal
                 pred_sig = self.predict(tmp.model_params, S0=tmp.model_S0)
                 leverages = np.ones_like(data_thres, dtype=np.float64) # FIXME: hacking the leverages for now, they are not even that important
-                w, robust = weight_method(data_thres, pred_sig, self.design_matrix, leverages=leverages, idx=rdx, total_idx=TDX)
+                #w, robust = weight_method(data_thres, pred_sig, self.design_matrix, leverages=leverages, idx=rdx, total_idx=TDX, last_robust=robust)
+                w, robust = weight_method(data_thres, pred_sig, self.design_matrix, leverages, rdx, TDX, robust)  # remove as keywords
 
                 # TODO: now, just need to pass the appropriate info to this function (or to weights_method_gmm), and the weights should work!
                 #w, robust = weight_method(data_thres, self.design_matrix, params=None, leverages=None,

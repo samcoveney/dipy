@@ -1847,8 +1847,7 @@ def nlls_fit_tensor(design_matrix, data, weights=None,
         return params, None
 
 
-#def weight_method_gmm(data, design_matrix, params, leverages, idx, total_idx): #, adjacency=None):
-def weight_method_gmm(data, pred_sig, design_matrix, leverages, idx, total_idx): #, adjacency=None):
+def weight_method_gmm(data, pred_sig, design_matrix, leverages, idx, total_idx, last_robust):
     """
     Aim is to have the user supply these, in theory, but we can have some defaults.
     """
@@ -1869,51 +1868,31 @@ def weight_method_gmm(data, pred_sig, design_matrix, leverages, idx, total_idx):
     if N <= p: raise ValueError("Fewer data points than parameters.")
     factor = 1.4826 * np.sqrt(N / (N - p))
 
-
-    # TODO: iteration count shuold be arguments
-    # for WLS, need to do some unweighted fits after outlier rejection to estimate S, then do final weighted, otherwise using pred_S from the GMM weights in final fit...
-    # problem is that I am using the weights to switch the outliers on and off... so I can't easily do a 'clean' OLS fit to estimate predS...
-    # however! I could do a 'clean' OLS fit using w = 0 or 1 for a WLS fit! And THEN estimate predS, and THEN do the final WLS. That will work
-    # only way would be to modify the function, so on last iter, it fits only where w > 0 (or, say, not NaN), but that it different per voxel...
-
-#    print(data.shape, design_matrix.shape)
-    print(z.shape, pred_sig.shape, data.shape)
-
     C = factor * np.median(np.abs(z - np.median(z, axis=-1)[..., None]), axis=-1)[..., None]  # NOTE: IRLS eq9 correction
-    w = (C/pred_sig)**2 / ((C/pred_sig)**2 + log_residuals**2)**2
+    w = (C/pred_sig)**2 / ((C/pred_sig)**2 + log_residuals**2)**2  # GMM
+    #w = (C/pred_sig)**2 / ((C/pred_sig)**2 + log_residuals**2)  # Cauchy
     robust = None
 
-    # NOTE: hack to try to test out stuff - this is the usual weighting for WLS, so in theory answer should be roughly the same?
-#    w = pred_sig**2  # NOTE: this will depend on the method... RETWIQ leave weights on .... could do same for GMM if we wish
-
-
-    # NOTE : turned off for now, trying to test out what is going on
-    #if False:
     if idx >= total_idx - 1:  # the user should be able to specify things to do on the last iteration
 
-        # NOTE: not sure we want to run this in both the second to last and the last...
-        leverages[np.isclose(leverages, 1.0)] = 0.9999
-        #HAT_factor = np.sqrt(1 - leverages)
-        HAT_factor = 1  # NOTE: hack while testing!!! Needs putting back to normal
-        cond_a = (residuals > +cutoff*C*HAT_factor) | (log_residuals < -cutoff*C*HAT_factor/pred_sig)
-        #cond_b = (log_residuals > +cutoff*C*HAT_factor/pred_sig) | (residuals < -cutoff*C*HAT_factor)
-        cond = cond_a #| cond_b
-        robust = (cond == False)
-
-        print(idx, total_idx)
-        #print((robust==1)/(robust==1))
-        if idx == total_idx:
-            print("wls weight")
-            # does wls fit with the wls weights (but without outliers)
-            # in this case, I choose to discard the outliers and unweight the non-outliers
-            w[robust==0] = 0.0
-            w[robust==1] = pred_sig[robust==1]**2  # NOTE: this will depend on the method... RETWIQ leave weights on .... could do same for GMM if we wish
+        if last_robust is None:
+            # NOTE: not sure we want to run this in both the second to last and the last...
+            leverages[np.isclose(leverages, 1.0)] = 0.9999
+            #HAT_factor = np.sqrt(1 - leverages)
+            HAT_factor = 1  # NOTE: hack while testing!!! Needs putting back to normal
+            cond_a = (residuals > +cutoff*C*HAT_factor) | (log_residuals < -cutoff*C*HAT_factor/pred_sig)
+            #cond_b = (log_residuals > +cutoff*C*HAT_factor/pred_sig) | (residuals < -cutoff*C*HAT_factor)
+            cond = cond_a #| cond_b
+            robust = (cond == False)
         else:
-            print("zero weight")
-            # turns the wls fit into OLS but without the outliers
-            # in this case, I choose to discard the outliers and unweight the non-outliers
+            robust = last_robust
+
+        if idx == total_idx:  # WLS without outliers
             w[robust==0] = 0.0
-            w[robust==1] = 1.0  # NOTE: this will depend on the method... RETWIQ leave weights on .... could do same for GMM if we wish
+            w[robust==1] = pred_sig[robust==1]**2
+        else:  # OLS without outliers
+            w[robust==0] = 0.0
+            w[robust==1] = 1.0
 
     return w, robust  # NOTE: could return estimate of noise level, that is a very general thing to want to return for robust fitting
 
