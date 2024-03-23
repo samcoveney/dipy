@@ -27,24 +27,17 @@ def multi_voxel_fit(single_voxel_fit):
         elif mask.shape != data.shape[:-1]:
             raise ValueError("mask and data shape do not match")
 
-#        # NOTE: new, try to generalize weights
-#        if type(weights) is not np.ndarray:  # user supplied weights
-#            print("running this")
-#            weights = np.ones(data.shape[0], dtype=bool)
-#
-        #print("inside MV")
-
+        weights_is_array = True if type(weights) is np.ndarray else False
 
         # Fit data where mask is True
         fit_array = np.empty(data.shape[:-1], dtype=object)
         bar = tqdm(total=np.sum(mask), position=0)
         for ijk in ndindex(data.shape[:-1]):
             if mask[ijk]:
-                if type(weights) is np.ndarray:  # user supplied weights
-                    #print("in MV", weights[ijk])
-                    fit_array[ijk] = single_voxel_fit(self, data[ijk], weights=weights[ijk])  # NOTE: pass appropriate weights element
+                if weights_is_array:
+                    fit_array[ijk] = single_voxel_fit(self, data[ijk], weights=weights[ijk])
                 else:
-                    fit_array[ijk] = single_voxel_fit(self, data[ijk], weights)  # NOTE: pass appropriate weights element
+                    fit_array[ijk] = single_voxel_fit(self, data[ijk], weights)
                 bar.update()
         bar.close()
         return MultiVoxelFit(self, fit_array, mask)

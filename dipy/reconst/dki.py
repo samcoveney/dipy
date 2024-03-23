@@ -1780,31 +1780,32 @@ class DiffusionKurtosisModel(ReconstModel):
 
         return DiffusionKurtosisFit(self, params, model_S0=S0_params)
 
-    def robust_fit(self, data_thres, mask=None, weight_method=weight_method_gmm):  # FIXME: would need to utilize 'weight method' I think
-        TDX = 10
+    def robust_fit(self, data_thres, mask=None, weight_method=weight_method_gmm):
+        TDX = 10  # FIXME: should be input argument (would need to be at least 4 I think, first fit, then GMM, then OLS clean, then WLS clean
         for rdx in range(1, TDX+1):
-            print("rdx:", rdx)
+            print(rdx, "/", TDX)
 
             if rdx == 1:
                 w, robust = True, None
             else:
+                # if using mask, define full-sized weight and robust arrays
+                if rdx == 2 and mask is not None:
+                    cond = (mask == 1)
+                    w = np.ones_like(data_thres, dtype=float)
+                    robust = np.ones_like(data_thres)
+
                 # make prediction of the signal
                 pred_sig = self.predict(tmp.model_params, S0=tmp.model_S0)
                 leverages = np.ones_like(data_thres, dtype=np.float64) # FIXME: hacking the leverages for now, they are not even that important
-                #w, robust = weight_method(data_thres, pred_sig, self.design_matrix, leverages=leverages, idx=rdx, total_idx=TDX, last_robust=robust)
-                w, robust = weight_method(data_thres, pred_sig, self.design_matrix, leverages, rdx, TDX, robust)  # remove as keywords
 
-                # TODO: now, just need to pass the appropriate info to this function (or to weights_method_gmm), and the weights should work!
-                #w, robust = weight_method(data_thres, self.design_matrix, params=None, leverages=None,
-                #                          idx=rdx, total_idx=TDX) # , adjacency=adjacency)
-
-            # so... now we need a weight function...
-            #weights = np.ones_like(data_thres) * 1.2345
+                # define weights for next fit
+                if mask is not None:
+                    w[cond], robust_mask = weight_method(data_thres[cond], pred_sig[cond], self.design_matrix, leverages[cond], rdx, TDX, robust[cond])
+                    if robust_mask is not None: robust[cond] = robust_mask 
+                else:
+                    w, robust = weight_method(data_thres, pred_sig, self.design_matrix, leverages, rdx, TDX, robust, mask)
 
             tmp = self.multi_fit(data_thres, mask=mask, weights=w)
-
-            #import IPython as ipy
-            #ipy.embed()
 
         return tmp
 
