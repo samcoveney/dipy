@@ -763,7 +763,7 @@ class TensorModel(ReconstModel):
             raise ValueError(e_s)
         self.extra = {}
 
-    def fit(self, data, mask=None): # FIXME: remove, if another way works out... adjacency=False, weight_method=None):
+    def fit(self, data, mask=None): # FIXME: remove "adjacency", if another way to supply it is better... adjacency=False, weight_method=None):
         """ Fit method of the DTI model class
 
         Parameters
@@ -793,30 +793,6 @@ class TensorModel(ReconstModel):
 #        if adjacency > 0: # FIXME: remove, if it's better for user to supply the adjacency_calc results as keyword arg to TensorModel
 #            self.kwargs["adjacency"] = adjacency_calc(img_shape, mask,
 #                                                      adjacency)
-
-        if "sigma" in self.kwargs:
-            sigma = self.kwargs["sigma"]
-
-            if isinstance(sigma, np.ndarray):  # sigma passed as array
-                if sigma.size == 1:  # scalar passed as array
-                    sigma_in_mask = sigma[0]  # to scalar
-                else:
-                    if sigma.ndim > 1:  # spatially varying
-                        sigma_in_mask = np.reshape(sigma[mask], (-1, 1))
-                        if sigma_in_mask.size != data_in_mask.shape[0]:
-                            raise ValueError("ValueError: sigma size must\
-                                              equal number of voxels for\
-                                              spatial variation")
-                    else:  # image varying
-                        sigma_in_mask = sigma
-                        if sigma_in_mask.size != data_in_mask.shape[-1]:
-                            raise ValueError("ValueError: sigma size must\
-                                              equal number of images for\
-                                              image variation")
-            else:  # sigma passed as scalar
-                sigma_in_mask = sigma
-
-            self.kwargs["sigma"] = sigma_in_mask
 
         if self.min_signal is None:
             min_signal = MIN_POSITIVE_SIGNAL
@@ -1796,16 +1772,17 @@ def nlls_fit_tensor(design_matrix, data, weights=None,
 
             # Do the optimization in this voxel:
             if jac:
+                # FIXME: weights does indeed need to be indexed by voxel, but now many tests break because sigma was originally given
                 this_param, status = opt.leastsq(nlls.err_func, start_params,
                                                  args=(design_matrix,
                                                        flat_data[vox],
-                                                       weights),
+                                                       weights[vox]),
                                                  Dfun=nlls.jacobian_func)
             else:
                 this_param, status = opt.leastsq(nlls.err_func, start_params,
                                                  args=(design_matrix,
                                                        flat_data[vox],
-                                                       weights),
+                                                       weights[vox]),
                                                        )
 
             # Convert diffusion tensor parameters to the evals and the evecs:
@@ -1958,11 +1935,13 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
     # Detect if number of parameters corresponds to dti
     dti = (npa == 12)
 
+    # define some things # FIXME
+    p = design_matrix.shape[-1]
+    N = data.shape[-1]
+    factor = 1.4826 * np.sqrt(N / (N - p))
+
     # Flatten for the iteration over voxels:
     flat_data = data.reshape((-1, data.shape[-1]))
-    if isinstance(sigma, np.ndarray):
-        if sigma.ndim > 1:  # spatially varying
-            sigma = np.reshape(sigma, (-1, 1))
 
     # calculate OLS solution
     D, _ = ols_fit_tensor(design_matrix, flat_data, return_lower_triangular=True)
@@ -1990,40 +1969,40 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
         start_params = ols_params[vox]
 
-        # set sigma value
-        if np.iterable(sigma):
-            sigma_vox = sigma[vox, 0] if sigma.ndim > 1 else sigma
-        else:
-            sigma_vox = sigma
-
         try:
 
-            # Do nlls using sigma weighting in this voxel:
+            # Do unweighted nlls in this voxel:
             if jac:
                 this_param, status = opt.leastsq(nlls.err_func, start_params,
                                                  args=(design_matrix,
-                                                       flat_data[vox],
-                                                       'sigma',
-                                                       sigma_vox),
+                                                       flat_data[vox]),
                                                  Dfun=nlls.jacobian_func)
             else:
                 this_param, status = opt.leastsq(nlls.err_func, start_params,
                                                  args=(design_matrix,
-                                                       flat_data[vox],
-                                                       'sigma',
-                                                       sigma_vox))
+                                                       flat_data[vox]))
 
             # Get the residuals:
             pred_sig = np.exp(np.dot(design_matrix, this_param))
             residuals = flat_data[vox] - pred_sig
 
+            # estimate or set sigma
+            if sigma is not None:
+                C = sigma
+            else:
+                C = factor * np.median(np.abs(residuals - np.median(residuals)))
+
             # If any of the residuals are outliers (using 3 sigma as a
             # criterion following Chang et al., e.g page 1089):
-            if np.any(np.abs(residuals) > 3 * sigma_vox):
+            test_sigma = np.any(np.abs(residuals) > 3 * C)
+
+            # test for doing robust reweighting
+            if test_sigma:
 
                 rdx = 1
                 while rdx <= 10:  # NOTE: capped at 10 iterations
-                    C = 1.4826 * np.median(np.abs(residuals - np.median(residuals)))
+                    # robust GMM weights (original Restore paper used Cauchy weights by accident)
+                    C = factor * np.median(np.abs(residuals - np.median(residuals)))
                     denominator = (C**2 + residuals**2)**2
                     gmm = np.divide(C**2, denominator,
                                     out=np.zeros_like(denominator),
@@ -2033,14 +2012,13 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
                     if jac:
                         this_param, status = opt.leastsq(
                             nlls.err_func, start_params,
-                            args=(design_matrix, flat_data[vox], 'gmm', gmm),
+                            args=(design_matrix, flat_data[vox], gmm),
                             Dfun=nlls.jacobian_func)
                     else:
                         this_param, status = opt.leastsq(nlls.err_func,
                                                          start_params,
                                                          args=(design_matrix,
                                                                flat_data[vox],
-                                                               'gmm',
                                                                gmm))
 
                     # Recalculate residuals given gmm fit
@@ -2051,7 +2029,7 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
                     if perc < 0.1: break
                     rdx = rdx + 1
 
-                cond = np.abs(residuals) > 3 * sigma_vox
+                cond = np.abs(residuals) > 3 * C
                 if np.any(cond):
                     # If you still have outliers, refit without those outliers:
                     non_outlier_idx = np.where(cond == False)
@@ -2063,26 +2041,17 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
                     new_start, _ = ols_fit_tensor(clean_design, clean_data,
                                                return_lower_triangular=True)
 
-                    if np.iterable(sigma_vox):
-                        this_sigma = sigma_vox[non_outlier_idx]
-                    else:
-                        this_sigma = sigma_vox
-
                     if jac:
                         this_param, status = opt.leastsq(nlls.err_func,
                                                          new_start,
                                                          args=(clean_design,
-                                                               clean_data,
-                                                               'sigma',
-                                                               this_sigma),
+                                                               clean_data),
                                                          Dfun=nlls.jacobian_func)
                     else:
                         this_param, status = opt.leastsq(nlls.err_func,
                                                          new_start,
                                                          args=(clean_design,
-                                                               clean_data,
-                                                               'sigma',
-                                                               this_sigma))
+                                                               clean_data))
 
             # Convert diffusion tensor parameters to the evals and the evecs:
             evals, evecs = decompose_tensor(
@@ -2368,7 +2337,7 @@ def robust_fit_tensor(design_matrix, data, jac=True,
             params[vox, 12:] = params_flat[vox, 6:-1] / md2
 
     if resort_to_linear:
-        warnings.warn("Resorted to OLS solution in some voxels", UserWarning)
+        warnings.warn(ols_resort_msg, UserWarning)
 
     params.shape = data.shape[:-1] + (npa,)
     extra = {"robust": robust}
@@ -2705,7 +2674,7 @@ def retwiq_fit_tensor(design_matrix, data, jac=True,
             params[vox, 12:] = this_param[6:-1] / md2
 
     if resort_to_linear:
-        warnings.warn("Resorted to OLS solution in some voxels", UserWarning)
+        warnings.warn(ols_resort_msg, UserWarning)
 
     params.shape = data.shape[:-1] + (npa,)
     extra = {"robust": robust}

@@ -550,37 +550,33 @@ def test_nnls_jacobian_func(rng):
     error = rng.normal(scale=scale, size=Y.shape)
     Y = Y + error
 
-    # although sigma and gmm gradients seem correct from inspection,
-    # they are not accurate enough to pass the tests, leaving out
-    # for weighting in [None, "sigma", "gmm"]:
-    for weighting in [None]:
-        nlls = dti._NllsHelper()
+    nlls = dti._NllsHelper()
 
-        for D in [D_orig, np.zeros_like(D_orig)]:
+    for D in [D_orig, np.zeros_like(D_orig)]:
 
+        if weighting is None:
+            sigma = None
+        if weighting == "sigma":
+            sigma = 1.0 / np.abs(error)  # use residuals as estimate
+        if weighting == "gmm":
+            sigma = 1.4826 * np.median(np.abs(error - np.median(error)))
+
+        # Test Jacobian at D
+        args = [D, X, Y, weighting, sigma]
+        # NOTE: call 'err_func' first, to set internal stuff in the class
+        nlls.err_func(*args)
+        # NOTE: cal 'jabobian_func' with D (ensure cached vars are for D)
+        analytical = nlls.jacobian_func(*args)
+        for i in range(len(X)):
             if weighting is None:
-                sigma = None
+                args = [X[i], Y[i], sigma]
             if weighting == "sigma":
-                sigma = 1.0 / np.abs(error)  # use residuals as estimate
+                args = [X[i], Y[i], sigma[i]]
             if weighting == "gmm":
-                sigma = 1.4826 * np.median(np.abs(error - np.median(error)))
+                args = [X[i], Y[i], sigma]
+            approx = opt.approx_fprime(D, nlls.err_func, 1e-8, *args)
 
-            # Test Jacobian at D
-            args = [D, X, Y, weighting, sigma]
-            # NOTE: call 'err_func' first, to set internal stuff in the class
-            nlls.err_func(*args)
-            # NOTE: cal 'jabobian_func' with D (ensure cached vars are for D)
-            analytical = nlls.jacobian_func(*args)
-            for i in range(len(X)):
-                if weighting is None:
-                    args = [X[i], Y[i], weighting, sigma]
-                if weighting == "sigma":
-                    args = [X[i], Y[i], weighting, sigma[i]]
-                if weighting == "gmm":
-                    args = [X[i], Y[i], weighting, sigma]
-                approx = opt.approx_fprime(D, nlls.err_func, 1e-8, *args)
-
-                assert np.allclose(approx, analytical[i])
+            assert np.allclose(approx, analytical[i])
 
 
 def test_nlls_fit_tensor():
@@ -623,18 +619,14 @@ def test_nlls_fit_tensor():
     npt.assert_array_almost_equal(tensor_est.quadratic_form[0], tensor)
     npt.assert_almost_equal(tensor_est.md[0], md)
 
-    # Using the gmm weighting scheme:
-    tensor_model = dti.TensorModel(gtab, fit_method='NLLS', weighting='gmm',
-                                   sigma=1)
+    # Using weights:
+    weights = 2*np.ones_like(Y, dtype=np.float32)
+    tensor_model = dti.TensorModel(gtab, fit_method='NLLS', weights=weights)
     tensor_est = tensor_model.fit(Y)
     npt.assert_equal(tensor_est.shape, Y.shape[:-1])
     npt.assert_array_almost_equal(tensor_est.evals[0], evals)
     npt.assert_array_almost_equal(tensor_est.quadratic_form[0], tensor)
     npt.assert_almost_equal(tensor_est.md[0], md)
-
-    # If you use sigma weighting, you'd better provide a sigma:
-    tensor_model = dti.TensorModel(gtab, fit_method='NLLS', weighting='sigma')
-    npt.assert_raises(ValueError, tensor_model.fit, Y)
 
     # Use NLLS with some actual 4D data:
     data, bvals, bvecs = get_fnames('small_25')
@@ -653,31 +645,15 @@ def test_nlls_fit_tensor():
 
     # Test warning for failure of NLLS method, resort to OLS result
     # (reason for failure: too few data points for NLLS)
-    tensor_model = dti.TensorModel(gtab_less, fit_method='NLLS', sigma=1.0,
+    tensor_model = dti.TensorModel(gtab_less, fit_method='NLLS', 
                                    return_S0_hat=True)
     tmf = npt.assert_warns(UserWarning, tensor_model.fit, Y_less)
 
     # Test fail_is_nan=True, failed NLLS method gives NaN
-    tensor_model = dti.TensorModel(gtab_less, fit_method='NLLS', sigma=1.0,
+    tensor_model = dti.TensorModel(gtab_less, fit_method='NLLS',
                                    return_S0_hat=True, fail_is_nan=True)
     tmf = npt.assert_warns(UserWarning, tensor_model.fit, Y_less)
     npt.assert_equal(tmf[0].S0_hat, np.nan)
-
-    # Test sigma with an array
-    sigma = np.ones(Y_less.shape[-1])
-    tensor_model = dti.TensorModel(gtab_less, fit_method='NLLS',
-                                   weighting='sigma', sigma=sigma)
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore", message=ols_resort_msg,
-            category=UserWarning)
-        tmf = tensor_model.fit(Y_less)
-
-    # Test sigma with an array of wrong size
-    sigma = np.ones(Y_less.shape[-1] + 10)
-    tensor_model = dti.TensorModel(gtab_less, fit_method='NLLS',
-                                   weighting='sigma', sigma=sigma)
-    tmf = npt.assert_raises(ValueError, tensor_model.fit, Y_less)
 
 
 def test_restore():
@@ -724,6 +700,10 @@ def test_restore():
     # If sigma is very small, it still needs to work:
     tensor_model = dti.TensorModel(gtab, fit_method='restore', sigma=0.0001)
     tensor_model.fit(Y.copy())
+
+    # If sigma is very small, it still needs to work (it is estimated):
+    tensor_model = dti.TensorModel(gtab, fit_method='restore', sigma=None)
+    tensor_model.fit(Y.copy() + np.random.normal(size=Y.shape))
 
     # Test return_S0_hat
     tensor_model = dti.TensorModel(gtab, fit_method='restore', sigma=0.0001,

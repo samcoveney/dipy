@@ -8,6 +8,8 @@ def weights_method_m_est(data, pred_sig, design_matrix, leverages, idx, total_id
     M-estimator weights for weight-least-squares DTI problem.
     """
     # NOTE: would be preferable to not need design_matrix and leverages... figure this out
+    # NOTE: could provide 'adjacency' optionally, in which case the C estimates could be pooled
+    #       in which cases, we really want a function that returns a lambda function, given the appropriate arguments to the first function
 
     cutoff = 3 # could be an input
 
