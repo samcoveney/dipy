@@ -22,6 +22,7 @@ from dipy.core.optimize import PositiveDefiniteLeastSquares
 from dipy.data import get_sphere, get_fnames, load_sdp_constraints
 from dipy.reconst.vec_val_sum import vec_val_vect
 from dipy.core.gradients import check_multi_b
+from dipy.reconst.weights_method import weights_method_gm
 
 
 def _positive_evals(L1, L2, L3, er=2e-7):
@@ -1575,12 +1576,6 @@ def dki_prediction(dki_params, gtab, S0=1.):
 
     return pred_sig
 
-# FIXME: placing this weight method up here, out of the class... for now
-from dipy.reconst.dti import weight_method_gmm # FIXME: move this later, once the method is relocated 
-def weight_method_test(data, pred_sig, design_matrix, leverages, idx, total_idx):
-    # so... now we need a weight function...
-    weights = np.ones_like(data) * 1.0
-    return weights, None
 
 class DiffusionKurtosisModel(ReconstModel):
     """ Class for the Diffusion Kurtosis Model
@@ -1677,22 +1672,15 @@ class DiffusionKurtosisModel(ReconstModel):
                     'dki', self.convexity_level)
             self.sdp = PositiveDefiniteLeastSquares(22, A=self.sdp_constraints)
 
-        self.weights = fit_method in {'WLS', 'WLLS', 'UWLLS', 'CWLS'}  # FIXME: need to generalize how to define the weights now, right?
+        self.weights = fit_method in {'WLS', 'WLLS', 'UWLLS', 'CWLS'}
 
-        # NOTE: these routines are broken if not using the multi-fit method!
-        # Combine with the fact that 'fit' is also currently wrong
-        # (although I may have fixed it with my additions...)
-        # this may explain everything
-        if False:
-            self.is_multi_method = fit_method in ['WLS', 'OLS', 'UWLLS', 'ULLS',
-                                                  'WLLS', 'OLLS', 'CLS', 'CWLS']
-            self.is_robust_method = fit_method in []  # NOTE: can test using 'WLS' for now, to build my wrapper properly...
-        else:
-            self.is_multi_method = fit_method in ['OLS', 'UWLLS', 'ULLS', # FIXME : removed WLS for testing
-                                                  'WLLS', 'OLLS', 'CLS']
-            self.is_robust_method = fit_method in ['WLS', 'CWLS']  # NOTE: can test using 'WLS' for now, to build my wrapper properly...
+        self.is_multi_method = fit_method in ['WLS', 'OLS', 'UWLLS', 'ULLS',
+                                              'WLLS', 'OLLS', 'CLS', 'CWLS']
 
-    # FIXME: fit might be broken now, inverse_design_matrix is a keyword but isn't getting passed? And *self.args is after return_S0_hat
+        if "weights_method" not in self.kwargs:
+            self.kwargs["weights_method"] = None
+
+    # FIXME: need to ensure this still works for methods that are not "is_multi_method"
     def fit(self, data, mask=None):
         """ Fit method of the DKI model.
 
@@ -1706,16 +1694,17 @@ class DiffusionKurtosisModel(ReconstModel):
 
         """
         data_thres = np.maximum(data, self.min_signal)
-        if self.is_multi_method:
-            return self.multi_fit(data_thres, mask=mask)
-        if self.is_robust_method:  # NOTE: NEW idea : could put the robust iteration loop here and loop over multi_fit, or call new robust_fit that does this for us...
-            #return self.robust_fit(data_thres, mask=mask)  # FIXME: weight method maybe need here?
-            return self.robust_fit(data_thres, mask=mask, weight_method=self.kwargs["weight_method"])  # FIXME: weight method maybe need here?
 
+        if self.is_multi_method and self.kwargs["weights_method"] is None:
+            return self.multi_fit(data_thres, mask=mask, weights=self.weights)
+        if self.is_multi_method and self.kwargs["weights_method"] is not None:
+            # NOTE: maybe we call this 'iter_fit' or something more general?
+            return self.robust_fit(data_thres, mask=mask, weights_method=self.kwargs["weights_method"])
+
+        # NOTE: need to check that this still works with NLLS, or RETWIQ
         S0_params = None
         if data.ndim == 1:
             params, extra = self.fit_method(self.design_matrix, data_thres,
-                                            self.inverse_design_matrix, # NOTE: added, but isn't really working, because of how the fit functions are written
                                             return_S0_hat=self.return_S0_hat,
                                             *self.args, **self.kwargs)
             if self.return_S0_hat:
@@ -1755,22 +1744,16 @@ class DiffusionKurtosisModel(ReconstModel):
         return DiffusionKurtosisFit(self, dki_params, model_S0=S0_params)
 
     @multi_voxel_fit
-    def multi_fit(self, data_thres, mask=None, weights=True):  # NOTE: add weights=True
+    def multi_fit(self, data_thres, mask=None, weights=True):  # NOTE: add weights=True, because I need weights to be a kwarg
         extra_args = {} if not self.convexity_constraint else {
             'cvxpy_solver': self.cvxpy_solver,
             'sdp': self.sdp,
             }
-        # FIXME: so... now, self. weights would need to be allowed to be an array for each voxel
-        # so multi_fit would need to be able to pass the specific value of the weights
-        # so it would need to be an argument to multi_fit...
-        # NOTE: currently, I am defining the weight ARRAY inside of multi_voxel_fit, so this routine here obtains the correct values
-        #       the question is, where should the actual weights, defined from the fitting residuals, actuall get defined?
 
         params, extra = self.fit_method(self.design_matrix, data_thres,
                                         self.inverse_design_matrix,
                                         return_S0_hat=self.return_S0_hat,
-                                        #weights=self.weights,
-                                        weights=weights,  # NOTE: not using self.weights, but values passed in - may need to SET self.weights to be the values I want as a way to do it
+                                        weights=weights,
                                         min_diffusivity=self.min_diffusivity,
                                         **extra_args)
 
@@ -1780,7 +1763,7 @@ class DiffusionKurtosisModel(ReconstModel):
 
         return DiffusionKurtosisFit(self, params, model_S0=S0_params)
 
-    def robust_fit(self, data_thres, mask=None, weight_method=weight_method_gmm):
+    def robust_fit(self, data_thres, mask=None, weights_method=weights_method_gm):
         TDX = 10  # FIXME: should be input argument (would need to be at least 4 I think, first fit, then GMM, then OLS clean, then WLS clean
         for rdx in range(1, TDX+1):
             print(rdx, "/", TDX)
@@ -1800,10 +1783,10 @@ class DiffusionKurtosisModel(ReconstModel):
 
                 # define weights for next fit
                 if mask is not None:
-                    w[cond], robust_mask = weight_method(data_thres[cond], pred_sig[cond], self.design_matrix, leverages[cond], rdx, TDX, robust[cond])
+                    w[cond], robust_mask = weights_method(data_thres[cond], pred_sig[cond], self.design_matrix, leverages[cond], rdx, TDX, robust[cond])
                     if robust_mask is not None: robust[cond] = robust_mask 
                 else:
-                    w, robust = weight_method(data_thres, pred_sig, self.design_matrix, leverages, rdx, TDX, robust, mask)
+                    w, robust = weights_method(data_thres, pred_sig, self.design_matrix, leverages, rdx, TDX, robust, mask)
 
             tmp = self.multi_fit(data_thres, mask=mask, weights=w)
 
@@ -2309,61 +2292,6 @@ def params_to_dki_params(result, min_diffusivity=0):
     return dki_params
 
 
-#def cls_fit_dki(design_matrix, data, inverse_design_matrix, sdp,
-#                return_S0_hat=False, weights=True,
-#                min_diffusivity=0, cvxpy_solver=None):
-def robust_wls_fit_dki(design_matrix, data, inverse_design_matrix, sdp=None, # NOTE: sdp must be option, to allow choice! If None, use ls, if not None, use cls
-                       return_S0_hat=False,
-                       weights=None, # NOTE: hack so can be used
-                       weight_method=weight_method_gmm,
-                       min_diffusivity=0, cvxpy_solver=None):
-                       # NOTE: iterations should also be an argument
-    """
-    NOTE: this is only designed to work with WLS, but it should allow to use weights of our choice.
-          i.e. it should allow GMM, any other robust weighting once I code it, and RETWIQ.
-    """
-
-    # FIXME:
-    # may need to work differently due to the multi-fit: may need to call the fit function directly, so that all fits are completed before calculating the weights...
-    # this would make this a non-multi routine, that needed to call a multi-fit... hmmm
-    # for GMM it could be done 1 voxel at a time, but not for RETWIQ
-
-    # FIXME: maybe wrong approach
-    if weight_method is None:
-        weight_method = weight_method_gmm
-
-    # loop over the methods
-    TDX = 10
-    for rdx in range(1, TDX + 1):  # FIXME: needs to be a user-supplied argument
-
-        # NOTE: first iteration, weights really are none... so why does it fail to fir the OLS solution? Must fail when not using the multi-method
-        # and yet, with the mutli-method... we don't get the solution for all voxles first, ruling out RETWIQ (and making the current code break, because of shape assumptions)
-        if rdx == 1:
-            w, robust = None, None
-        else:
-            w, robust = weight_method(data, design_matrix, result, leverages,
-                                      rdx, TDX) # , adjacency=adjacency)
-
-        # calculate (C)WLS solution
-        if sdp is None:
-            result, extra = ls_fit_dki(design_matrix, data, inverse_design_matrix,
-                                  weights=w, return_lower_triangular=True, return_leverages=True)
-        else:
-            result, extra = cls_fit_dki(design_matrix, data, inverse_design_matrix,
-                                  weights=w, return_lower_triangular=True, return_leverages=True)
-        leverages = extra["leverages"]
-
-    # Write output
-    dki_params = params_to_dki_params(result, min_diffusivity=min_diffusivity)
-
-    # TODO: add handling of 'extra' to dki routines
-    extra = {"robust": robust}
-    if return_S0_hat:
-        return (dki_params[..., 0:-1], dki_params[..., -1]), None
-    else:
-        return dki_params[..., 0:-1], None
-
-
 def ls_fit_dki(design_matrix, data, inverse_design_matrix,
                return_S0_hat=False, weights=True,
                min_diffusivity=0,
@@ -2744,8 +2672,8 @@ common_fit_methods = {'WLS': ls_fit_dki,
                       'RESTORE': restore_fit_tensor,
                       'robust': robust_fit_tensor,
                       'ROBUST': robust_fit_tensor,
-                      'idea': robust_wls_fit_tensor,
-                      'idea2': robust_wls_fit_dki,
+                      'RWLS': robust_wls_fit_tensor,
+                      'RWLLS': robust_wls_fit_tensor,
                       'CLS': cls_fit_dki,
                       'CWLS': cls_fit_dki
                       }

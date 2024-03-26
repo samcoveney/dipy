@@ -13,6 +13,7 @@ from dipy.reconst.vec_val_sum import vec_val_vect
 from dipy.core.onetime import auto_attr
 from dipy.reconst.base import ReconstModel
 from dipy.utils.volume import adjacency_calc
+from dipy.reconst.weights_method import weights_method_gm
 
 # FIXME: tidy up
 import matplotlib.pyplot as plt
@@ -1847,59 +1848,9 @@ def nlls_fit_tensor(design_matrix, data, weights=None,
         return params, None
 
 
-def weight_method_gmm(data, pred_sig, design_matrix, leverages, idx, total_idx, last_robust):
-    """
-    Aim is to have the user supply these, in theory, but we can have some defaults.
-    """
-
-    cutoff = 3 # could be an input
-
-    # calculate quantities needed for C and w
-    #log_pred_sig = np.dot(design_matrix, params.T).T
-    #pred_sig = np.exp(log_pred_sig)
-    log_pred_sig = np.log(pred_sig) # NOTE: inefficient to recalc but who cares
-    residuals = data - pred_sig
-    log_data = np.log(data)  # Waste to recalc, but I want to hand things to 'weight_method'
-    log_residuals = log_data - log_pred_sig
-    z = pred_sig * log_residuals
-
-    p = design_matrix.shape[-1]
-    N = data.shape[-1]
-    if N <= p: raise ValueError("Fewer data points than parameters.")
-    factor = 1.4826 * np.sqrt(N / (N - p))
-
-    C = factor * np.median(np.abs(z - np.median(z, axis=-1)[..., None]), axis=-1)[..., None]  # NOTE: IRLS eq9 correction
-    w = (C/pred_sig)**2 / ((C/pred_sig)**2 + log_residuals**2)**2  # GMM
-    #w = (C/pred_sig)**2 / ((C/pred_sig)**2 + log_residuals**2)  # Cauchy
-    robust = None
-
-    if idx >= total_idx - 1:  # the user should be able to specify things to do on the last iteration
-
-        if last_robust is None:
-            # NOTE: not sure we want to run this in both the second to last and the last...
-            leverages[np.isclose(leverages, 1.0)] = 0.9999
-            #HAT_factor = np.sqrt(1 - leverages)
-            HAT_factor = 1  # NOTE: hack while testing!!! Needs putting back to normal
-            cond_a = (residuals > +cutoff*C*HAT_factor) | (log_residuals < -cutoff*C*HAT_factor/pred_sig)
-            #cond_b = (log_residuals > +cutoff*C*HAT_factor/pred_sig) | (residuals < -cutoff*C*HAT_factor)
-            cond = cond_a #| cond_b
-            robust = (cond == False)
-        else:
-            robust = last_robust
-
-        if idx == total_idx:  # WLS without outliers
-            w[robust==0] = 0.0
-            w[robust==1] = pred_sig[robust==1]**2
-        else:  # OLS without outliers
-            w[robust==0] = 0.0
-            w[robust==1] = 1.0
-
-    return w, robust  # NOTE: could return estimate of noise level, that is a very general thing to want to return for robust fitting
-
-
 def robust_wls_fit_tensor(design_matrix, data, jac=True,
                           return_S0_hat=False,
-                          weight_method=weight_method_gmm):
+                          weights_method=weights_method_gm):
                           # NOTE: iterations should also be an argument
     """
     NOTE: this is only designed to work with WLS, but it should allow to use weights of our choice.
@@ -1914,14 +1865,8 @@ def robust_wls_fit_tensor(design_matrix, data, jac=True,
         raise ValueError("Fewer data points than parameters.")
 
     # Detect if number of parameters corresponds to dti
-    # NOTE: not sure this will still work with dki
     npa = p + 5
     dti = (npa == 12)
-
-
-    # FIXME: maybe wrong approach
-    if weight_method is None:
-        weight_method = weight_method_gmm
 
     # loop over the methods
     TDX = 10
@@ -1933,7 +1878,7 @@ def robust_wls_fit_tensor(design_matrix, data, jac=True,
             #w, robust = weight_method(data, design_matrix, D, leverages, rdx, TDX) # , adjacency=adjacency)
             log_pred_sig = np.dot(design_matrix, D.T).T
             pred_sig = np.exp(log_pred_sig)
-            w, robust = weight_method(data, pred_sig, design_matrix, leverages, rdx, TDX) # , adjacency=adjacency)
+            w, robust = weights_method(data, pred_sig, design_matrix, leverages, rdx, TDX, robust) # , adjacency=adjacency)
 
         # calculate WLS solution
         D, extra = wls_fit_tensor(design_matrix, data, weights=w, return_lower_triangular=True, return_leverages=True)
@@ -1948,8 +1893,7 @@ def robust_wls_fit_tensor(design_matrix, data, jac=True,
 
     if return_S0_hat:
         model_S0 = np.exp(-D[:, -1])
-    if not dti: # FIXME: not sure this will work with DKI at the moment
-        print(evals.shape)
+    if not dti:
         md2 = evals.mean(axis=1)[:, None] ** 2  # NOTE: I change from axis 0 to axis 1
         params[:, 12:] = D[:, 6:-1] / md2 # NOTE: I change from params to D
 
@@ -2984,5 +2928,6 @@ common_fit_methods = {'WLS': wls_fit_tensor,
                       'ROBUST': robust_fit_tensor,
                       'retwiq': retwiq_fit_tensor,
                       'RETWIQ': retwiq_fit_tensor,
-                      'idea': robust_wls_fit_tensor
+                      'RWLS': robust_wls_fit_tensor,
+                      'RWLLS': robust_wls_fit_tensor,
                       }
