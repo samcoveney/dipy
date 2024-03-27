@@ -10,8 +10,9 @@ from dipy.reconst.dti import (TensorFit, mean_diffusivity,
                               from_lower_triangular,
                               lower_triangular, decompose_tensor,
                               MIN_POSITIVE_SIGNAL, nlls_fit_tensor,
-                              restore_fit_tensor, robust_fit_tensor,
-                              robust_wls_fit_tensor)
+                              restore_fit_tensor,
+                              iterative_fit_tensor,
+                              robust_fit_tensor_wls, robust_fit_tensor_nlls)
 from dipy.reconst.utils import dki_design_matrix as design_matrix
 from dipy.reconst.recspeed import local_maxima
 from dipy.reconst.base import ReconstModel
@@ -22,7 +23,7 @@ from dipy.core.optimize import PositiveDefiniteLeastSquares
 from dipy.data import get_sphere, get_fnames, load_sdp_constraints
 from dipy.reconst.vec_val_sum import vec_val_vect
 from dipy.core.gradients import check_multi_b
-from dipy.reconst.weights_method import weights_method_gm
+from dipy.reconst.weights_method import weights_method_wls_gm, weights_method_nlls_gm
 
 
 def _positive_evals(L1, L2, L3, er=2e-7):
@@ -1677,8 +1678,7 @@ class DiffusionKurtosisModel(ReconstModel):
         self.is_multi_method = fit_method in ['WLS', 'OLS', 'UWLLS', 'ULLS',
                                               'WLLS', 'OLLS', 'CLS', 'CWLS']
 
-        if "weights_method" not in self.kwargs:
-            self.kwargs["weights_method"] = None
+        self.is_iter_method = True if "weights_method" in self.kwargs else False
 
     # FIXME: need to ensure this still works for methods that are not "is_multi_method"
     def fit(self, data, mask=None):
@@ -1695,9 +1695,9 @@ class DiffusionKurtosisModel(ReconstModel):
         """
         data_thres = np.maximum(data, self.min_signal)
 
-        if self.is_multi_method and self.kwargs["weights_method"] is None:
+        if self.is_multi_method and (self.is_iter_method == False):
             return self.multi_fit(data_thres, mask=mask, weights=self.weights)
-        if self.is_multi_method and self.kwargs["weights_method"] is not None:
+        if self.is_multi_method and (self.is_iter_method == True):
             # NOTE: maybe we call this 'iter_fit' or something more general?
             return self.robust_fit(data_thres, mask=mask, weights_method=self.kwargs["weights_method"])
 
@@ -1763,7 +1763,7 @@ class DiffusionKurtosisModel(ReconstModel):
 
         return DiffusionKurtosisFit(self, params, model_S0=S0_params)
 
-    def robust_fit(self, data_thres, mask=None, weights_method=weights_method_gm):
+    def robust_fit(self, data_thres, mask=None, weights_method=weights_method_wls_gm):
         TDX = 10  # FIXME: should be input argument (would need to be at least 4 I think, first fit, then GMM, then OLS clean, then WLS clean
         for rdx in range(1, TDX+1):
             print(rdx, "/", TDX)
@@ -2670,10 +2670,9 @@ common_fit_methods = {'WLS': ls_fit_dki,
                       'RT': restore_fit_tensor,
                       'restore': restore_fit_tensor,
                       'RESTORE': restore_fit_tensor,
-                      'robust': robust_fit_tensor,
-                      'ROBUST': robust_fit_tensor,
-                      'RWLS': robust_wls_fit_tensor,
-                      'RWLLS': robust_wls_fit_tensor,
+                      'IRLS': iterative_fit_tensor,
+                      'RWLS': robust_fit_tensor_wls,
+                      'RNLLS': robust_fit_tensor_nlls,
                       'CLS': cls_fit_dki,
                       'CWLS': cls_fit_dki
                       }
