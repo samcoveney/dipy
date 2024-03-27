@@ -1563,6 +1563,7 @@ def _ols_fit_matrix(design_matrix):
     return np.dot(U, U.T)
 
 
+#import autograd.numpy as np  # Thinly-wrapped numpy  # FIXME: remove later
 class _NllsHelper():
     r"""Class with member functions to return nlls error and derivative.
     """
@@ -1749,7 +1750,8 @@ def nlls_fit_tensor(design_matrix, data, weights=None,
 
     if init_params is None:
         # Use the OLS method parameters as the starting point for the optimization:
-        D, _ = ols_fit_tensor(design_matrix, flat_data, return_lower_triangular=True)
+        D, extra = ols_fit_tensor(design_matrix, flat_data, return_lower_triangular=True, return_leverages=return_leverages)
+        leverages = extra["leverages"]
 
         # Flatten for the iteration over voxels:
         ols_params = np.reshape(D, (-1, D.shape[-1]))
@@ -1826,9 +1828,10 @@ def nlls_fit_tensor(design_matrix, data, weights=None,
     if resort_to_linear:
         warnings.warn(ols_resort_msg, UserWarning)
 
-    leverages = np.ones_like(data, dtype=np.float64) # FIXME: hacking the leverages for now, they are not even that important
-    if leverages is not None:
+    if return_leverages:
         leverages = {"leverages": leverages}
+    else:
+        leverages = None
 
     if return_lower_triangular:
         return flat_params, leverages
@@ -2063,7 +2066,7 @@ def iterative_fit_tensor(design_matrix, data, jac=True,
     dti = (npa == 12)
 
     # loop over the methods
-    D = None # NOTE: for NLLS, initially set this to be None
+    D = None # for NLLS, initially set this to be None
     TDX = 10  # FIXME: iterations should also be an argument
     for rdx in range(1, TDX + 1):
         print(rdx)
@@ -2076,11 +2079,16 @@ def iterative_fit_tensor(design_matrix, data, jac=True,
             w, robust = weights_method(data, pred_sig, design_matrix, leverages, rdx, TDX, robust)
 
         if fit_type == "WLS":
-            D, extra = wls_fit_tensor(design_matrix, data, weights=w, return_lower_triangular=True, return_leverages=True)
+            D, extra = wls_fit_tensor(design_matrix, data, weights=w,
+                                      return_lower_triangular=True,
+                                      return_leverages=True)
+            leverages = extra["leverages"]
         if fit_type == "NLLS":
-            D, extra = nlls_fit_tensor(design_matrix, data, weights=w, return_lower_triangular=True, return_leverages=True, init_params=D)
-
-        leverages = extra["leverages"]
+            D, extra = nlls_fit_tensor(design_matrix, data, weights=w,
+                                       return_lower_triangular=True,
+                                       return_leverages=(rdx == 1),
+                                       init_params=D)
+            if rdx == 1: leverages = extra["leverages"]
 
     # Convert diffusion tensor parameters to the evals and the evecs:
     evals, evecs = decompose_tensor(
@@ -2092,7 +2100,7 @@ def iterative_fit_tensor(design_matrix, data, jac=True,
     if return_S0_hat:
         model_S0 = np.exp(-D[:, -1])
     if not dti:
-        md2 = evals.mean(axis=1)[:, None] ** 2  # NOTE: I change from axis 0 to axis !!! NEED TO CHECK !!!
+        md2 = evals.mean(axis=1)[:, None] ** 2  # NOTE: I change from axis 0 to axis 1 otherwise it doesn't work! 
         params[:, 12:] = D[:, 6:-1] / md2 # NOTE: I change from params to D
 
     extra = {"robust": robust}

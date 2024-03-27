@@ -1721,7 +1721,6 @@ class DiffusionKurtosisModel(ReconstModel):
         data_in_mask = np.maximum(data_in_mask, self.min_signal)
 
         params, extra = self.fit_method(self.design_matrix, data_in_mask,
-                                        self.inverse_design_matrix, # NOTE: added, but isn't really working, because of how the fit functions are written
                                         return_S0_hat=self.return_S0_hat,
                                         *self.args, **self.kwargs)
 

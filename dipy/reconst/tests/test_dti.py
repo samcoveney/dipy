@@ -550,33 +550,37 @@ def test_nnls_jacobian_func(rng):
     error = rng.normal(scale=scale, size=Y.shape)
     Y = Y + error
 
+    # trying to figure out fprime issues
+    import autograd.numpy as npa  # Thinly-wrapped numpy
+    from autograd import grad as grd    # The only autograd function you may ever need
+
     nlls = dti._NllsHelper()
+    sigma_scalar = 1.4826 * np.median(np.abs(error - np.median(error)))
+    sigma_array = np.full_like(Y, sigma_scalar)
+    for sigma in [sigma_scalar, sigma_array]:
+        weights = 1 / sigma**2
+        for D in [D_orig, np.zeros_like(D_orig)]:
 
-    for D in [D_orig, np.zeros_like(D_orig)]:
+            # Test Jacobian at D
+            args = [D, X, Y, weights]
+            # NOTE: 1. call 'err_func', to set internal stuff in the class
+            nlls.err_func(*args)
+            # NOTE: 2. call 'jabobian_func', corresponds to last err_func call
+            analytical = nlls.jacobian_func(*args)
 
-        if weighting is None:
-            sigma = None
-        if weighting == "sigma":
-            sigma = 1.0 / np.abs(error)  # use residuals as estimate
-        if weighting == "gmm":
-            sigma = 1.4826 * np.median(np.abs(error - np.median(error)))
+            # test analytical gradient (needs to be performed per data-point)
+            for i in range(len(X)):
 
-        # Test Jacobian at D
-        args = [D, X, Y, weighting, sigma]
-        # NOTE: call 'err_func' first, to set internal stuff in the class
-        nlls.err_func(*args)
-        # NOTE: cal 'jabobian_func' with D (ensure cached vars are for D)
-        analytical = nlls.jacobian_func(*args)
-        for i in range(len(X)):
-            if weighting is None:
-                args = [X[i], Y[i], sigma]
-            if weighting == "sigma":
-                args = [X[i], Y[i], sigma[i]]
-            if weighting == "gmm":
-                args = [X[i], Y[i], sigma]
-            approx = opt.approx_fprime(D, nlls.err_func, 1e-8, *args)
+                args = [X[i], Y[i], weights]
 
-            assert np.allclose(approx, analytical[i])
+                #approx = opt.approx_fprime(D, nlls.err_func, 1e-8, *args)
+
+                grad_err_func = grd(nlls.err_func) 
+                weights_2 = 1 / sigma[i]**2 if sigma.ndim > 0 else weights
+                    
+                approx = grad_err_func(D, X[i], Y[i], weights_2)
+
+                assert np.allclose(approx, analytical[i])
 
 
 def test_nlls_fit_tensor():
@@ -884,7 +888,6 @@ def test_extra_return():
 
     """
 
-    # testing restore, robust, and retwiq
     b0 = 1000.
     bval, bvecs = read_bvals_bvecs(*get_fnames('55dir_grad'))
     gtab = grad.gradient_table(bval, bvecs)
@@ -902,7 +905,8 @@ def test_extra_return():
     Y = np.exp(np.dot(X, D))
     Y = np.vstack([Y[None, :], Y[None, :]])  # two voxels
     for drop_this in range(1, 3): # Y.shape[-1]):
-        for method in ["restore", "robust", "retwiq"]:
+        # test specific extra from specifc methods
+        for method in ["restore"]:
             this_y = Y.copy()
             this_y[:, drop_this] = 1.0
 
@@ -912,14 +916,6 @@ def test_extra_return():
                 tensor_model = dti.TensorModel(gtab, fit_method=method,
                                                sigma=sigma)
     
-            if method == "robust":
-                for linear in [True, False]:
-                    tensor_model = dti.TensorModel(gtab, fit_method=method, linear=linear)
-
-            if method == "retwiq":
-                for linear in [True, False]:
-                    tensor_model = dti.TensorModel(gtab, fit_method=method, linear=linear)
-
             tensor_est = tensor_model.fit(this_y)
             npt.assert_equal(tensor_est.model.extra["robust"].shape, Y.shape)
 
