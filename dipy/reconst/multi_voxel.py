@@ -12,7 +12,7 @@ def multi_voxel_fit(single_voxel_fit):
     """Method decorator to turn a single voxel model fit
     definition into a multi voxel model fit definition
     """
-    def new_fit(self, data, mask=None, weights=True): # NOTE: added weights=True as default
+    def new_fit(self, data, mask=None, weights=True, **kwargs):
         """Fit method for every voxel in data"""
         # If only one voxel just return a normal fit
         if data.ndim == 1:
@@ -31,16 +31,22 @@ def multi_voxel_fit(single_voxel_fit):
 
         # Fit data where mask is True
         fit_array = np.empty(data.shape[:-1], dtype=object)
+        extra_list = []
+        # TODO: space for 'extra' returns
         bar = tqdm(total=np.sum(mask), position=0)
         for ijk in ndindex(data.shape[:-1]):
             if mask[ijk]:
+                # TODO: obtain and stored extra returns
                 if weights_is_array:
-                    fit_array[ijk] = single_voxel_fit(self, data[ijk], mask=None, weights=weights[ijk])
+                    fit_array[ijk], extra = single_voxel_fit(self, data[ijk], mask=None, weights=weights[ijk], **kwargs)
                 else:
-                    fit_array[ijk] = single_voxel_fit(self, data[ijk], mask=None, weights=weights)
+                    fit_array[ijk], extra = single_voxel_fit(self, data[ijk], mask=None, weights=weights, **kwargs)
+                extra_list.append(extra)
                 bar.update()
         bar.close()
-        return MultiVoxelFit(self, fit_array, mask)
+        extra = {key: np.vstack([e[key] for e in extra_list]) for key in extra_list[0]}  # FIXME: only results in mask, so would need mask to index extra
+        return MultiVoxelFit(self, fit_array, mask), extra  # TODO: somehow put extra returns somewhere here..., return alongside the fit? Or put into MultiVoxelFit?
+        # In DTI, self.extra belonged to TensorModel, so to be equivalent here, it should belong to DiffusionKurtosisModel, somehow
     return new_fit
 
 
