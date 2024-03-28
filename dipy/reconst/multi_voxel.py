@@ -35,9 +35,9 @@ def multi_voxel_fit(single_voxel_fit):
         for ijk in ndindex(data.shape[:-1]):
             if mask[ijk]:
                 if weights_is_array:
-                    fit_array[ijk] = single_voxel_fit(self, data[ijk], weights=weights[ijk])
+                    fit_array[ijk] = single_voxel_fit(self, data[ijk], mask=None, weights=weights[ijk])
                 else:
-                    fit_array[ijk] = single_voxel_fit(self, data[ijk], weights)
+                    fit_array[ijk] = single_voxel_fit(self, data[ijk], mask=None, weights=weights)
                 bar.update()
         bar.close()
         return MultiVoxelFit(self, fit_array, mask)

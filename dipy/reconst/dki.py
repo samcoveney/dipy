@@ -1743,7 +1743,7 @@ class DiffusionKurtosisModel(ReconstModel):
         return DiffusionKurtosisFit(self, dki_params, model_S0=S0_params)
 
     @multi_voxel_fit
-    def multi_fit(self, data_thres, mask=None, weights=True):  # NOTE: add weights=True, because I need weights to be a kwarg
+    def multi_fit(self, data_thres, mask=None, weights=True):
         extra_args = {} if not self.convexity_constraint else {
             'cvxpy_solver': self.cvxpy_solver,
             'sdp': self.sdp,
@@ -1778,7 +1778,7 @@ class DiffusionKurtosisModel(ReconstModel):
 
                 # make prediction of the signal
                 pred_sig = self.predict(tmp.model_params, S0=tmp.model_S0)
-                leverages = np.ones_like(data_thres, dtype=np.float64) # FIXME: hacking the leverages for now, they are not even that important
+                #leverages = np.ones_like(data_thres, dtype=np.float64) # FIXME: hacking the leverages for now, they are not even that important
 
                 # define weights for next fit
                 if mask is not None:
@@ -2340,30 +2340,31 @@ def ls_fit_dki(design_matrix, data, inverse_design_matrix,
     y = np.log(data)
 
     if weights is not False:
+        # define W as "sqrt of the weights applied to *squared* residuals"
         if type(weights) is np.ndarray: # user supplied weights
-            W = np.diag(weights)
-        else: # Define weights as diag(yn**2)
-            # DKI ordinary linear least square solution
+            W = np.diag(np.sqrt(weights))
+        else: # Define weights as diag(fn) (fitted signal from DKI OLS)
             result = np.dot(inverse_design_matrix, y)
-            W = np.diag(np.exp(2 * np.dot(A, result)))
+            W = np.diag(np.exp(np.dot(A, result)))
 
-        AT_W = np.dot(A.T, W)
-        inv_AT_W_A = np.linalg.pinv(np.dot(AT_W, A))
-        AT_W_LS = np.dot(AT_W, y)
-        result = np.dot(inv_AT_W_A, AT_W_LS)
+        W_A = np.dot(W, A)
+        inv_W_A_W = np.linalg.pinv(W_A).dot(W)
+        result = np.dot(inv_W_A_W, y)
+
+        if return_leverages:
+            leverages = np.einsum('ij,ji->i', design_matrix, inv_W_A_W)
+
     else:
         # DKI ordinary linear least square solution
         result = np.dot(inverse_design_matrix, y)
 
-    # TODO: add calculation of leverages... hacking for now 
-    if return_leverages == False:
-        leverages = None
-    else:
-        #leverages = result.shape[1] * np.ones_like(data.shape[0]) / data.shape[0]
-        leverages = np.ones_like(data.shape[0])
+        if return_leverages:
+            leverages = np.einsum('ij,ji->i', design_matrix, inverse_design_matrix)
 
-    if leverages is not None:
+    if return_leverages:
         leverages = {"leverages": leverages}
+    else:
+        leverages = None
 
     if return_lower_triangular:
         return result, leverages
@@ -2372,9 +2373,9 @@ def ls_fit_dki(design_matrix, data, inverse_design_matrix,
     dki_params = params_to_dki_params(result, min_diffusivity=min_diffusivity)
 
     if return_S0_hat:
-        return (dki_params[..., 0:-1], dki_params[..., -1]), None
+        return (dki_params[..., 0:-1], dki_params[..., -1]), leverages
     else:
-        return dki_params[..., 0:-1], None
+        return dki_params[..., 0:-1], leverages
 
 
 def cls_fit_dki(design_matrix, data, inverse_design_matrix, sdp,
@@ -2431,29 +2432,28 @@ def cls_fit_dki(design_matrix, data, inverse_design_matrix, sdp,
     A = design_matrix
     y = np.log(data)
 
+    # define W as "sqrt of the weights applied to *squared* residuals"
     if weights is not False:
         if type(weights) is np.ndarray: # use supplied weights
-            W = np.diag(np.sqrt(weights))  # NOTE: we may need sqrt(weights!) because of how they are incorporated!
-        else: # Define weights as diag(yn**2)
-            # DKI ordinary linear least square solution
+            W = np.diag(np.sqrt(weights))
+        else: # Define weights as diag(fn) (fitted signal from DKI OLS)
             result = np.dot(inverse_design_matrix, y)
-            W = np.diag(np.exp(np.dot(A, result)))  # NOTE: no square!
+            W = np.diag(np.exp(np.dot(A, result)))
 
         A = np.dot(W, A)
         y = np.dot(W, y)
 
+        if return_leverages:
+            inv_W_A_W = np.linalg.pinv(A).dot(W)
+            leverages = np.einsum('ij,ji->i', design_matrix, inv_W_A_W)
+
     # Solve sdp
     result = sdp.solve(A, y, check=True, solver=cvxpy_solver)
 
-    # TODO: add calculation of leverages... hacking for now 
-    if return_leverages == False:
-        leverages = None
-    else:
-        #leverages = result.shape[1] * np.ones_like(data.shape[0]) / data.shape[0]
-        leverages = np.ones_like(data.shape[0])
-
-    if leverages is not None:
+    if return_leverages:
         leverages = {"leverages": leverages}
+    else:
+        leverages = None
 
     if return_lower_triangular:
         return result, leverages
