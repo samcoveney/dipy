@@ -1679,8 +1679,11 @@ class DiffusionKurtosisModel(ReconstModel):
                                               'WLLS', 'OLLS', 'CLS', 'CWLS']
 
         self.is_iter_method = True if "weights_method" in self.kwargs else False
+        if "num_iter" not in self.kwargs and self.is_iter_method:
+            self.kwargs["num_iter"] = 4
 
-    # FIXME: need to ensure this still works for methods that are not "is_multi_method"
+        self.extra = {}
+
     def fit(self, data, mask=None):
         """ Fit method of the DKI model.
 
@@ -1696,19 +1699,33 @@ class DiffusionKurtosisModel(ReconstModel):
         data_thres = np.maximum(data, self.min_signal)
 
         if self.is_multi_method and (self.is_iter_method == False):
-            return self.multi_fit(data_thres, mask=mask, weights=self.weights)
-        if self.is_multi_method and (self.is_iter_method == True):
-            # NOTE: maybe we call this 'iter_fit' or something more general?
-            return self.robust_fit(data_thres, mask=mask, weights_method=self.kwargs["weights_method"])
+            fit_result, extra = self.multi_fit(data_thres, mask=mask,
+                                               weights=self.weights)
+            self.extra = extra
+            return fit_result
 
-        # NOTE: need to check that this still works with NLLS, or RETWIQ
+        if self.is_multi_method and (self.is_iter_method == True):
+            fit_result, extra =\
+              self.iterative_fit(data_thres, mask=mask,
+                                 num_iter=self.kwargs["num_iter"],
+                                 weights_method=self.kwargs["weights_method"])
+            self.extra = extra
+            return fit_result
+
         S0_params = None
+
+        # NOTE: what is the use case here? single voxel? Will 'extra' work here? Also, there is no mask handling
         if data.ndim == 1:
             params, extra = self.fit_method(self.design_matrix, data_thres,
                                             return_S0_hat=self.return_S0_hat,
                                             *self.args, **self.kwargs)
             if self.return_S0_hat:
                 params, S0_params = params
+            if extra is not None:
+                for key in extra:
+                    self.extra[key] = extra[key]
+            else:
+                self.extra = None
             return DiffusionKurtosisFit(self, params, model_S0=S0_params)
 
         if mask is not None:
@@ -1732,6 +1749,11 @@ class DiffusionKurtosisModel(ReconstModel):
             dki_params = params.reshape(out_shape)
             if self.return_S0_hat:
                 S0_params = S0_params.reshape(out_shape).squeeze()
+            if extra is not None:
+                for key in extra:
+                    self.extra[key] = extra[key].reshape(data.shape)
+            else:
+                self.extra = None
         else:
             dki_params = np.zeros(data.shape[:-1] + (27,))
             dki_params[mask, :] = params
@@ -1739,6 +1761,12 @@ class DiffusionKurtosisModel(ReconstModel):
                 S0_params_in_mask = np.zeros(data.shape[:-1])
                 S0_params_in_mask[mask] = S0_params.squeeze()
                 S0_params = S0_params_in_mask
+            if extra is not None:
+                for key in extra:
+                    self.extra[key] = np.zeros(data.shape)
+                    self.extra[key][mask, :] = extra[key]
+            else:
+                self.extra = None
 
         return DiffusionKurtosisFit(self, dki_params, model_S0=S0_params)
 
@@ -1757,48 +1785,46 @@ class DiffusionKurtosisModel(ReconstModel):
                                         **extra_args,
                                         **kwargs)
 
-        #self.extra = extra  # FIXME this is what we did before... but for multi_fit this won't work...
-
         S0_params = None
         if self.return_S0_hat:
             params, S0_params = params
 
         return DiffusionKurtosisFit(self, params, model_S0=S0_params), extra
 
-    def robust_fit(self, data_thres, mask=None, weights_method=weights_method_wls_gm):
-        TDX = 10  # FIXME: should be input argument (would need to be at least 4 I think, first fit, then GMM, then OLS clean, then WLS clean
+    def iterative_fit(self, data_thres, mask=None, num_iter=4, weights_method=weights_method_wls_gm):
+        if num_iter < 2:  # otherwise, weights_method will not be utilized
+            raise ValueError("num_iter must be 2+")
+        TDX = num_iter  # FIXME: should be input argument (would need to be at least 4 I think, first fit, then GMM, then OLS clean, then WLS clean
         for rdx in range(1, TDX+1):
             print(rdx, "/", TDX)
 
             if rdx == 1:
                 w, robust = True, None
+                # NOTE: w = True here, otherwise OLS would be applied instead 
             else:
                 # if using mask, define full-sized weight and robust arrays
                 if rdx == 2 and mask is not None:
                     cond = (mask == 1)
                     w = np.ones_like(data_thres, dtype=float)
-                    robust = np.ones_like(data_thres)
+                    robust = np.zeros_like(data_thres)
+                    robust[cond] = 1
 
                 # make prediction of the signal
                 pred_sig = self.predict(tmp.model_params, S0=tmp.model_S0)
-                #leverages = np.ones_like(data_thres, dtype=np.float64) # FIXME: hacking the leverages for now, they are not even that important
 
                 # define weights for next fit
                 if mask is not None:
-                    # NOTE: currently, extra (and therefore leverages) is only defined for the mask
-                    #w[cond], robust_mask = weights_method(data_thres[cond], pred_sig[cond], self.design_matrix, leverages[cond], rdx, TDX, robust[cond])
-                    w[cond], robust_mask = weights_method(data_thres[cond], pred_sig[cond], self.design_matrix, leverages, rdx, TDX, robust[cond])
+                    w[cond], robust_mask = weights_method(data_thres[cond], pred_sig[cond], self.design_matrix, leverages[cond], rdx, TDX, robust[cond])
                     if robust_mask is not None: robust[cond] = robust_mask 
                 else:
                     #print(data_thres.shape, leverages.shape)
-                    # NOTE: leverages is flattened over space currently, needs reshaping here to be used
                     w, robust = weights_method(data_thres, pred_sig, self.design_matrix, leverages.reshape(data_thres.shape[0:-1] + (-1,)), rdx, TDX, robust)
 
             tmp, extra = self.multi_fit(data_thres, mask=mask, weights=w, return_leverages=True)
             leverages = extra["leverages"]
-            #print(leverages)
 
-        return tmp  # return extra here too, if True need to also retun in 'fit' above?
+        extra = {"robust": robust}
+        return tmp, extra  # NOTE: return extra here too, if True need to also retun in 'fit' above?
 
     def predict(self, dki_params, S0=1.):
         """ Predict a signal for this DKI model class instance given parameters

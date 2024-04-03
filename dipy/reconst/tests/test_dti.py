@@ -550,10 +550,6 @@ def test_nnls_jacobian_func(rng):
     error = rng.normal(scale=scale, size=Y.shape)
     Y = Y + error
 
-    # trying to figure out fprime issues
-    import autograd.numpy as npa  # Thinly-wrapped numpy
-    from autograd import grad as grd    # The only autograd function you may ever need
-
     nlls = dti._NllsHelper()
     sigma_scalar = 1.4826 * np.median(np.abs(error - np.median(error)))
     sigma_array = np.full_like(Y, sigma_scalar)
@@ -563,9 +559,9 @@ def test_nnls_jacobian_func(rng):
 
             # Test Jacobian at D
             args = [D, X, Y, weights]
-            # NOTE: 1. call 'err_func', to set internal stuff in the class
+            # 1. call 'err_func', to set internal stuff in the class
             nlls.err_func(*args)
-            # NOTE: 2. call 'jabobian_func', corresponds to last err_func call
+            # 2. call 'jabobian_func', corresponds to last err_func call
             analytical = nlls.jacobian_func(*args)
 
             # test analytical gradient (needs to be performed per data-point)
@@ -573,12 +569,7 @@ def test_nnls_jacobian_func(rng):
 
                 args = [X[i], Y[i], weights]
 
-                #approx = opt.approx_fprime(D, nlls.err_func, 1e-8, *args)
-
-                grad_err_func = grd(nlls.err_func) 
-                weights_2 = 1 / sigma[i]**2 if sigma.ndim > 0 else weights
-                    
-                approx = grad_err_func(D, X[i], Y[i], weights_2)
+                approx = opt.approx_fprime(D, nlls.err_func, 1e-8, *args)
 
                 assert np.allclose(approx, analytical[i])
 

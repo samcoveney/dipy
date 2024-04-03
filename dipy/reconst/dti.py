@@ -1563,7 +1563,6 @@ def _ols_fit_matrix(design_matrix):
     return np.dot(U, U.T)
 
 
-#import autograd.numpy as np  # Thinly-wrapped numpy  # FIXME: remove later
 class _NllsHelper():
     r"""Class with member functions to return nlls error and derivative.
     """
@@ -1751,7 +1750,8 @@ def nlls_fit_tensor(design_matrix, data, weights=None,
     if init_params is None:
         # Use the OLS method parameters as the starting point for the optimization:
         D, extra = ols_fit_tensor(design_matrix, flat_data, return_lower_triangular=True, return_leverages=return_leverages)
-        leverages = extra["leverages"]
+        if extra is not None:
+           leverages = extra["leverages"]
 
         # Flatten for the iteration over voxels:
         ols_params = np.reshape(D, (-1, D.shape[-1]))
@@ -2042,9 +2042,10 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
 
 
 def iterative_fit_tensor(design_matrix, data, jac=True,
-                          return_S0_hat=False,
-                          fit_type=None,
-                          weights_method=None):
+                         return_S0_hat=False,
+                         fit_type=None,
+                         num_iter=4,
+                         weights_method=None):
     """
     Iteratively fit tensors, defining new fitting weights after each fit.
     """
@@ -2053,6 +2054,10 @@ def iterative_fit_tensor(design_matrix, data, jac=True,
         raise ValueError("fit_type must be provided")
     if weights_method is None:
         raise ValueError("weights_method must be provided")
+    if num_iter < 2:  # otherwise, weights_method will not be utilized
+        raise ValueError("num_iter must be 2+")
+    if fit_type not in ["WLS", "NLLS"]:
+        raise ValueError("fit_type must be 'WLS' or 'NLLS'")
 
     # Detect number of parameters to estimate from design_matrix length plus
     # 5 due to diffusion tensor conversion to eigenvalue and eigenvectors
@@ -2067,12 +2072,13 @@ def iterative_fit_tensor(design_matrix, data, jac=True,
 
     # loop over the methods
     D = None # for NLLS, initially set this to be None
-    TDX = 10  # FIXME: iterations should also be an argument
+    TDX = num_iter  # FIXME: iterations should also be an argument
     for rdx in range(1, TDX + 1):
         print(rdx)
 
         if rdx == 1:
             w, robust = None, None
+            # NOTE: okay that w = None here, because wls_fit_tensor will apply 'the usual' WLS weights
         else:
             log_pred_sig = np.dot(design_matrix, D.T).T
             pred_sig = np.exp(log_pred_sig)
@@ -2112,12 +2118,14 @@ def iterative_fit_tensor(design_matrix, data, jac=True,
 
 
 # define robust WLS and NLLS functions using GM M-estimators
+# FIXME: could define more examples, including to iterate purely on defining S on each iteration
+# FIXME: should probably put 'gm' into these convenience names?
 robust_fit_tensor_wls = lambda *args, **kwargs:\
-  iterative_fit_tensor(*args, **kwargs, fit_type="WLS",\
-  weights_method=weights_method_wls_gm)
+  iterative_fit_tensor(*args, **kwargs,
+    fit_type="WLS", weights_method=weights_method_wls_gm)
 robust_fit_tensor_nlls = lambda *args, **kwargs:\
-  iterative_fit_tensor(*args, **kwargs, fit_type="NLLS",\
-  weights_method=weights_method_nlls_gm)
+  iterative_fit_tensor(*args, **kwargs,
+    fit_type="NLLS", weights_method=weights_method_nlls_gm)
 
 
 _lt_indices = np.array([[0, 1, 3],

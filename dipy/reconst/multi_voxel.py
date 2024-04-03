@@ -32,11 +32,9 @@ def multi_voxel_fit(single_voxel_fit):
         # Fit data where mask is True
         fit_array = np.empty(data.shape[:-1], dtype=object)
         extra_list = []
-        # TODO: space for 'extra' returns
         bar = tqdm(total=np.sum(mask), position=0)
         for ijk in ndindex(data.shape[:-1]):
             if mask[ijk]:
-                # TODO: obtain and stored extra returns
                 if weights_is_array:
                     fit_array[ijk], extra = single_voxel_fit(self, data[ijk], mask=None, weights=weights[ijk], **kwargs)
                 else:
@@ -44,9 +42,13 @@ def multi_voxel_fit(single_voxel_fit):
                 extra_list.append(extra)
                 bar.update()
         bar.close()
-        extra = {key: np.vstack([e[key] for e in extra_list]) for key in extra_list[0]}  # FIXME: only results in mask, so would need mask to index extra
-        return MultiVoxelFit(self, fit_array, mask), extra  # TODO: somehow put extra returns somewhere here..., return alongside the fit? Or put into MultiVoxelFit?
-        # In DTI, self.extra belonged to TensorModel, so to be equivalent here, it should belong to DiffusionKurtosisModel, somehow
+        if extra is not None:
+            extra_mask = {key: np.vstack([e[key] for e in extra_list])\
+                            for key in extra_list[0]}
+            for key in extra_mask:
+                extra[key] = np.zeros(data.shape)
+                extra[key][mask == 1] = extra_mask[key]
+        return MultiVoxelFit(self, fit_array, mask), extra
     return new_fit
 
 
