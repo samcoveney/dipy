@@ -15,12 +15,6 @@ from dipy.reconst.base import ReconstModel
 from dipy.utils.volume import adjacency_calc
 from dipy.reconst.weights_method import weights_method_wls_gm, weights_method_nlls_gm
 
-# FIXME: tidy up
-import matplotlib.pyplot as plt
-from scipy.linalg import eigh
-from scipy.spatial.distance import cdist
-from scipy.stats import chi2
-
 MIN_POSITIVE_SIGNAL = 0.0001
 
 ols_resort_msg = "Resorted to OLS solution in some voxels"
@@ -763,7 +757,7 @@ class TensorModel(ReconstModel):
             raise ValueError(e_s)
         self.extra = {}
 
-    def fit(self, data, mask=None): # FIXME: remove "adjacency", if another way to supply it is better... adjacency=False, weight_method=None):
+    def fit(self, data, mask=None):
         """ Fit method of the DTI model class
 
         Parameters
@@ -774,10 +768,6 @@ class TensorModel(ReconstModel):
         mask : array
             A boolean array used to mark the coordinates in the data that
             should be analyzed that has the shape data.shape[:-1]
-
-        adjacency : float, optional
-            Calculate voxel adjacency accounting for mask, using this
-            value as cutoff distance (measured in voxel coordinates)
         """
 
         S0_params = None
@@ -789,10 +779,6 @@ class TensorModel(ReconstModel):
                 raise ValueError("Mask is not the same shape as data.")
             mask = np.array(mask, dtype=bool, copy=False)
         data_in_mask = np.reshape(data[mask], (-1, data.shape[-1]))
-
-#        if adjacency > 0: # FIXME: remove, if it's better for user to supply the adjacency_calc results as keyword arg to TensorModel
-#            self.kwargs["adjacency"] = adjacency_calc(img_shape, mask,
-#                                                      adjacency)
 
         if self.min_signal is None:
             min_signal = MIN_POSITIVE_SIGNAL
@@ -1296,7 +1282,9 @@ def iter_fit_tensor(step=1e4):
             data : array ([X, Y, Z, ...], g)
                 Data or response variables holding the data. Note that the last
                 dimension should contain the data. It makes no copies of data.
-            weights : TODO!!!!!!!!!!!!
+            weights : array ([X, Y, Z, ...], g), optional
+                Weights to apply for fitting. These weights must correspond to
+                the squared residuals such that $S = \sum_i w_i r_i^2$.
             return_S0_hat : bool
                 Boolean to return (True) or not (False) the S0 values for the
                 fit.
@@ -1318,7 +1306,6 @@ def iter_fit_tensor(step=1e4):
             data = data.reshape(-1, data.shape[-1])
             if weights is not None:
                 weights = weights.reshape(-1, weights.shape[-1])
-            # NOTE: code to make things work with DKI as well
             if design_matrix.shape[-1] == 22: # DKI
                 sz = 22
             else: # DTI
@@ -1380,7 +1367,11 @@ def wls_fit_tensor(design_matrix, data, weights=None, return_S0_hat=False,
     data : array ([X, Y, Z, ...], g)
         Data or response variables holding the data. Note that the last
         dimension should contain the data. It makes no copies of data.
-    weights : TODO !!!!!!!!!!!!!!!!!!!
+    weights : array ([X, Y, Z, ...], g), optional
+        Weights to apply for fitting. These weights must correspond to the
+        squared residuals such that $S = \sum_i w_i r_i^2$.
+        If not provided, weights are estimated as the squared predicted signal
+        from an initial OLS fit [1]_.
     return_S0_hat : bool
         Boolean to return (True) or not (False) the S0 values for the fit.
     return_lower_triangular : bool
@@ -1440,7 +1431,7 @@ def wls_fit_tensor(design_matrix, data, weights=None, return_S0_hat=False,
                                        return_lower_triangular=True)
         w = np.exp(fit_result @ design_matrix.T)
     else:
-        w = np.sqrt(weights)  # NOTE: important, if passing in weights, ensure they correspond to R^2
+        w = np.sqrt(weights)
 
     # the weighted problem design_matrix * w is much larger (differs per voxel)
     if return_leverages == False:
@@ -1449,7 +1440,8 @@ def wls_fit_tensor(design_matrix, data, weights=None, return_S0_hat=False,
                                w * log_s)
         leverages = None
     else:
-        tmp = np.einsum('...ij,...j->...ij', np.linalg.pinv(design_matrix * w[..., None]), w)  # NOTE: weight on end here 
+        tmp = np.einsum('...ij,...j->...ij',
+                        np.linalg.pinv(design_matrix * w[..., None]), w)
         fit_result = np.einsum('...ij,...j', tmp, log_s)
         leverages = np.einsum('ij,...ji->...i', design_matrix, tmp)
 
@@ -1467,9 +1459,8 @@ def wls_fit_tensor(design_matrix, data, weights=None, return_S0_hat=False,
         return eig_from_lo_tri(fit_result,
                                min_diffusivity=tol / -design_matrix.min()), leverages
 
-
 @iter_fit_tensor()
-def ols_fit_tensor(design_matrix, data, weights=None, return_S0_hat=False,
+def ols_fit_tensor(design_matrix, data, return_S0_hat=False,
                    return_lower_triangular=False, return_leverages=False):
     r"""
     Computes ordinary least squares (OLS) fit to calculate self-diffusion
@@ -1582,32 +1573,10 @@ class _NllsHelper():
         data : array
             The voxel signal in all gradient directions
 
-        weights : TODO !!!!!!!!!!!!!!!!!!!
+        weights : array ([X, Y, Z, ...], g), optional
+            Weights to apply for fitting. These weights must correspond to the
+            squared residuals such that $S = \sum_i w_i r_i^2$.
 
-        Notes
-        -----
-        The Geman-McClure M-estimator is described as follows [1]_ (page 1089):
-        "The scale factor C affects the shape of the GMM
-        [Geman-McClure M-estimator] weighting function and represents the expected
-        spread of the residuals (i.e., the SD of the residuals) due to Gaussian
-        distributed noise. The scale factor C can be estimated by many robust scale
-        estimators. We used the median absolute deviation (MAD) estimator because
-        it is very robust to outliers having a 50% breakdown point (6,7).
-        The explicit formula for C using the MAD estimator is:
-
-        .. math ::
-
-                C = 1.4826 x MAD = 1.4826 x median{|r1-\hat{r}|,... |r_n-\hat{r}|}
-
-        where $\hat{r} = median{r_1, r_2, ..., r_3}$ and n is the number of data
-        points. The multiplicative constant 1.4826 makes this an approximately
-        unbiased estimate of scale when the error model is Gaussian."
-
-
-        References
-        ----------
-        .. [1] Chang, L-C, Jones, DK and Pierpaoli, C (2005). RESTORE: robust
-        estimation of tensors by outlier rejection. MRM, 53: 1088-95.
         """
         # This is the predicted signal given the params:
         y = np.exp(np.dot(design_matrix, tensor))
@@ -1637,7 +1606,8 @@ class _NllsHelper():
 
         Notes
         -----
-        This is an implementation of equation 14 in [1]_.
+        This is an implementation of equation 14 in [1]_, but also
+        accounts for weights on the squared residuals if provided.
 
         References
         ----------
@@ -1721,15 +1691,17 @@ def nlls_fit_tensor(design_matrix, data, weights=None,
         Data or response variables holding the data. Note that the last
         dimension should contain the data. It makes no copies of data.
 
-    weights : TODO !!!!!!!!!!!!!!!!!!!
+    weights : array ([X, Y, Z, ...], g), optional
+        Weights to apply for fitting. These weights must correspond to the
+        squared residuals such that $S = \sum_i w_i r_i^2$.
 
-    jac : bool
+    jac : bool, optional
         Use the Jacobian? Default: True
 
-    return_S0_hat : bool
+    return_S0_hat : bool, optional
         Boolean to return (True) or not (False) the S0 values for the fit.
 
-    fail_is_nan : bool
+    fail_is_nan : bool, optional
         Boolean to set failed NL fitting to NaN (True) or LS (False, default).
 
     Returns
@@ -1755,14 +1727,14 @@ def nlls_fit_tensor(design_matrix, data, weights=None,
 
         # Flatten for the iteration over voxels:
         ols_params = np.reshape(D, (-1, D.shape[-1]))
-        # FIXME: these could be 'start values' since if iterating, we would start from last fit
     else:
+        # Replace starting guess for opt (usually ols_params) with init_params
         ols_params = init_params
 
     # Initialize parameter matrix
     params = np.empty((flat_data.shape[0], npa))
 
-    # Initialize parameter matrix for storing flattened parameters # NOTE: new, in case returning flattened parameters
+    # Initialize parameter matrix for storing flattened parameters
     flat_params = np.empty_like(ols_params)
 
     # For warnings
@@ -1792,7 +1764,7 @@ def nlls_fit_tensor(design_matrix, data, weights=None,
                                                    weights_vox),
                                              Dfun=jac_func)
 
-            flat_params[vox] = this_param  # NOTE: new
+            flat_params[vox] = this_param
 
             # Convert diffusion tensor parameters to the evals and the evecs:
             evals, evecs = decompose_tensor(
@@ -1806,7 +1778,7 @@ def nlls_fit_tensor(design_matrix, data, weights=None,
             resort_to_linear = True
             this_param = start_params
 
-            flat_params[vox] = this_param  # NOTE: new, also note that this is ignoring NaN possibility
+            flat_params[vox] = this_param  # NOTE: ignores fail_is_nan
 
             if not fail_is_nan:
                 # Convert diffusion tensor parameters to evals and evecs
@@ -1848,7 +1820,10 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
                        return_S0_hat=False,
                        fail_is_nan=False):
     """
-    Use the RESTORE algorithm [1]_ to calculate a robust tensor fit
+    Use the RESTORE algorithm [1]_ to calculate a robust tensor fit.
+    Note that [1]_ does not define Geman–McClure M-estimator weights as
+    claimed (instead, Cauchy M-estimator weights are defined), but this function
+    does define these weights correctly.
 
     Parameters
     ----------
@@ -1861,14 +1836,13 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
         Data or response variables holding the data. Note that the last
         dimension should contain the data. It makes no copies of data.
 
-    # FIXME: need to change this now
-    sigma : float, array of shape [n_directions], array of shape [X, Y, Z]
+    sigma : float, optional
         An estimate of the variance. [1]_ recommend to use
         1.5267 * std(background_noise), where background_noise is estimated
         from some part of the image known to contain no signal (only noise).
-        Array with ndim > 1 corresponds to spatially varying sigma, so if
-        providing spatially-flattened data and spatially-varying sigma,
-        provide array with shape [num_vox, 1].
+        If not provided, will be estimated per voxel as:
+        sigma = 1.4826 * sqrt(N / (N - p)) * MAD(residuals)
+        as in [2]_ but with additional correction factor 1.4826 for MAD.
 
     jac : bool, optional
         Whether to use the Jacobian of the tensor to speed the non-linear
@@ -1888,8 +1862,11 @@ def restore_fit_tensor(design_matrix, data, sigma=None, jac=True,
     References
     ----------
     .. [1] Chang, L-C, Jones, DK and Pierpaoli, C (2005). RESTORE: robust
-    estimation of tensors by outlier rejection. MRM, 53: 1088-95.
-
+    estimation of tensors by outlier rejection. MRM, 53: 1088-1095.
+    .. [2] Chang, L-C, Walker, L and Jones, DK (2012). Informed RESTORE: A
+    method for robust estimation of diffusion tensor from low redundancy
+    datasets in the presence of physiological noise artifacts.
+    MRM, 68: 1654-1663.
     """
     # Detect number of parameters to estimate from design_matrix length plus
     # 5 due to diffusion tensor conversion to eigenvalue and eigenvectors
@@ -2072,9 +2049,8 @@ def iterative_fit_tensor(design_matrix, data, jac=True,
 
     # loop over the methods
     D = None # for NLLS, initially set this to be None
-    TDX = num_iter  # FIXME: iterations should also be an argument
+    TDX = num_iter
     for rdx in range(1, TDX + 1):
-        print(rdx)
 
         if rdx == 1:
             w, robust = None, None
@@ -2118,8 +2094,6 @@ def iterative_fit_tensor(design_matrix, data, jac=True,
 
 
 # define robust WLS and NLLS functions using GM M-estimators
-# FIXME: could define more examples, including to iterate purely on defining S on each iteration
-# FIXME: should probably put 'gm' into these convenience names?
 robust_fit_tensor_wls = lambda *args, **kwargs:\
   iterative_fit_tensor(*args, **kwargs,
     fit_type="WLS", weights_method=weights_method_wls_gm)

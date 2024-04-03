@@ -5,6 +5,7 @@ import numpy as np
 
 MIN_POSITIVE_SIGNAL = 0.0001
 
+
 def weights_method_wls_m_est(data, pred_sig, design_matrix, leverages, idx, total_idx, last_robust, m_est="gm"):
     """
     M-estimator weights for weight-least-squares problem.
@@ -66,11 +67,6 @@ def weights_method_wls_m_est(data, pred_sig, design_matrix, leverages, idx, tota
     return w, robust
 
 
-# define specific M-estimators
-weights_method_wls_gm = lambda *args: weights_method_wls_m_est(*args, "gm")
-weights_method_wls_cauchy = lambda *args: weights_method_wls_m_est(*args, "cauchy")
-
-
 def weights_method_nlls_m_est(data, pred_sig, design_matrix, leverages, idx, total_idx, last_robust, m_est="gm"):
     """
     M-estimator weights for non-linear least squares problem.
@@ -130,6 +126,8 @@ def weights_method_nlls_m_est(data, pred_sig, design_matrix, leverages, idx, tot
 
 
 # define specific M-estimators
+weights_method_wls_gm = lambda *args: weights_method_wls_m_est(*args, "gm")
 weights_method_nlls_gm = lambda *args: weights_method_nlls_m_est(*args, "gm")
+weights_method_wls_cauchy = lambda *args: weights_method_wls_m_est(*args, "cauchy")
 weights_method_nlls_cauchy = lambda *args: weights_method_nlls_m_est(*args, "cauchy")
 
