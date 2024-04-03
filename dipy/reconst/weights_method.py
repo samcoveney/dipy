@@ -1,5 +1,5 @@
 #!/usr/bin/python
-""" Functions for defining robust weights for fitting problems """
+""" Functions for defining weights for iterative fitting methods."""
 
 import numpy as np
 
@@ -9,6 +9,7 @@ MIN_POSITIVE_SIGNAL = 0.0001
 def weights_method_wls_m_est(data, pred_sig, design_matrix, leverages, idx, total_idx, last_robust, m_est="gm"):
     """
     M-estimator weights for weight-least-squares problem.
+    FIXME: provide proper docstring
     """
     # check if M-estimator is valid (defined in this function)
     if m_est not in ["gm", "cauchy"]:
@@ -70,6 +71,7 @@ def weights_method_wls_m_est(data, pred_sig, design_matrix, leverages, idx, tota
 def weights_method_nlls_m_est(data, pred_sig, design_matrix, leverages, idx, total_idx, last_robust, m_est="gm"):
     """
     M-estimator weights for non-linear least squares problem.
+    FIXME: provide proper docstring
     """
     # check if M-estimator is valid (defined in this function)
     if m_est not in ["gm", "cauchy"]:
@@ -106,12 +108,12 @@ def weights_method_nlls_m_est(data, pred_sig, design_matrix, leverages, idx, tot
 
     robust = None
 
-    if idx == total_idx:  # the user should be able to specify things to do on the last iteration
+    if idx == total_idx:
 
         leverages[np.isclose(leverages, 1.0)] = 0.99  # avoids rare issues
         HAT_factor = np.sqrt(1 - leverages)
         cond_a = (residuals > +cutoff*C*HAT_factor) | (log_residuals < -cutoff*C*HAT_factor/pred_sig)
-        # FIXME: for NLLS weighting, perhaps we should use *only* the +/- 3 sigma rule?
+        # FIXME: for NLLS weighting, need to decide how best to define outliers
         #cond_b = (log_residuals > +cutoff*C*HAT_factor/pred_sig) | (residuals < -cutoff*C*HAT_factor)
         cond = cond_a #| cond_b
         robust = (cond == False)

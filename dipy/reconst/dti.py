@@ -12,8 +12,8 @@ from dipy.core.geometry import vector_norm
 from dipy.reconst.vec_val_sum import vec_val_vect
 from dipy.core.onetime import auto_attr
 from dipy.reconst.base import ReconstModel
-from dipy.utils.volume import adjacency_calc
-from dipy.reconst.weights_method import weights_method_wls_gm, weights_method_nlls_gm
+from dipy.reconst.weights_method import (weights_method_wls_gm,
+                                         weights_method_nlls_gm)
 
 MIN_POSITIVE_SIGNAL = 0.0001
 
@@ -2025,6 +2025,7 @@ def iterative_fit_tensor(design_matrix, data, jac=True,
                          weights_method=None):
     """
     Iteratively fit tensors, defining new fitting weights after each fit.
+    FIXME: provide proper docstring
     """
 
     if fit_type is None:
