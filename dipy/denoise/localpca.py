@@ -300,9 +300,14 @@ def genpca(
     elif isinstance(sigma, (int, float)):
         var = sigma**2 * np.ones(arr.shape[:-1])
 
+    REFACTOR = False
     dim = arr.shape[-1]
     if tau_factor is None:
-        tau_factor = 1 + np.sqrt(dim / num_samples)
+        if not(REFACTOR):
+            tau_factor = 1 + np.sqrt(dim / num_samples)
+        else:
+            # NOTE: must change for my approach!
+            tau_factor = 1 + np.sqrt(72 / 75)
 
     theta = np.zeros(arr.shape, dtype=calc_dtype)
     thetax = np.zeros(arr.shape, dtype=calc_dtype)
@@ -326,6 +331,14 @@ def genpca(
                 kx2 = k + patch_radius_arr[2] + 1
 
                 X = arr[ix1:ix2, jx1:jx2, kx1:kx2].reshape(num_samples, dim)
+                if REFACTOR:
+                    # NOTE: new reshape!
+                    ZEROS = np.zeros([75, 72])
+                    ZEROS[0:25] = X[:, 0:72]
+                    ZEROS[25:50] = X[:, 72:2*72]
+                    ZEROS[50:75] = X[:, 2*72:]
+                    X = ZEROS
+
                 # compute the mean
                 M = np.mean(X, axis=0)
                 # Upcast the dtype for precision in the SVD
@@ -365,9 +378,17 @@ def genpca(
 
                 # This is equations 1 and 2 in Manjon 2013:
                 Xest = X.dot(W).dot(W.T) + M
-                Xest = Xest.reshape(patch_size[0], patch_size[1], patch_size[2], dim)
                 # This is equation 3 in Manjon 2013:
-                this_theta = 1.0 / (1.0 + dim - ncomps)
+                if not(REFACTOR):
+                    this_theta = 1.0 / (1.0 + dim - ncomps)
+                    Xest = Xest.reshape(patch_size[0], patch_size[1], patch_size[2], dim)
+                else:
+                    this_theta = 1.0 / (1.0 + Xest.shape[1] - ncomps)
+                    ZEROS = np.zeros([patch_size[0], patch_size[1], patch_size[2], dim])
+                    ZEROS[:, :, 0, 0:72] = Xest[0:25].reshape([5, 5, 72])
+                    ZEROS[:, :, 0, 72:2*72] = Xest[25:50].reshape([5, 5, 72])
+                    ZEROS[:, :, 0, 2*72:] = Xest[50:75].reshape([5, 5, 72])
+                    Xest = ZEROS
                 theta[ix1:ix2, jx1:jx2, kx1:kx2] += this_theta
                 thetax[ix1:ix2, jx1:jx2, kx1:kx2] += Xest * this_theta
                 if return_sigma is True and sigma is None:
