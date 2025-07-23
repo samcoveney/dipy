@@ -80,6 +80,11 @@ def _pca_classifier(L, nvoxels):
         r = L[c] - L[0] - 4 * np.sqrt((c + 1.0) / nvoxels) * var
     ncomps = c + 1
 
+    #print("nvox", nvoxels)
+    #print("L:", L)
+    #print("ncomps:", ncomps)
+    #input("wait")
+
     return var, ncomps
 
 
@@ -189,6 +194,7 @@ def genpca(
     return_sigma=False,
     out_dtype=None,
     suppress_warning=False,
+    IND=None
 ):
     r"""General function to perform PCA-based denoising of diffusion datasets.
 
@@ -300,14 +306,20 @@ def genpca(
     elif isinstance(sigma, (int, float)):
         var = sigma**2 * np.ones(arr.shape[:-1])
 
-    REFACTOR = False
+    REFACTOR = True
+    IMG_SAMPLES = True
     dim = arr.shape[-1]
     if tau_factor is None:
         if not(REFACTOR):
-            tau_factor = 1 + np.sqrt(dim / num_samples)
+            if IMG_SAMPLES:  # NOTE: because we will swap them
+                tau_factor = 1 + np.sqrt(num_samples / dim)
+            else:
+                tau_factor = 1 + np.sqrt(dim / num_samples)
         else:
             # NOTE: must change for my approach!
             tau_factor = 1 + np.sqrt(72 / 75)
+            #tau_factor = 1 + np.sqrt(36 / 54) ## required if we do our swap
+            tau_factor = 1 + np.sqrt(75 / 72) ## required if we do our swap
 
     theta = np.zeros(arr.shape, dtype=calc_dtype)
     thetax = np.zeros(arr.shape, dtype=calc_dtype)
@@ -333,11 +345,16 @@ def genpca(
                 X = arr[ix1:ix2, jx1:jx2, kx1:kx2].reshape(num_samples, dim)
                 if REFACTOR:
                     # NOTE: new reshape!
+                    #ZEROS = np.zeros([54, 36])
+                    #for abc in range(6):
+                    #    ZEROS[abc*9:(abc+1)*9]  = X[:, (abc)*36:(abc+1)*36]
                     ZEROS = np.zeros([75, 72])
-                    ZEROS[0:25] = X[:, 0:72]
-                    ZEROS[25:50] = X[:, 72:2*72]
-                    ZEROS[50:75] = X[:, 2*72:]
+                    for abc in range(3):
+                        ZEROS[abc*25:(abc+1)*25]  = X[:, (abc)*72:(abc+1)*72]
                     X = ZEROS
+
+                if IMG_SAMPLES:
+                    X = X.T  # NOTE: try to swap dims (don't worry 72 < 75 for now)
 
                 # compute the mean
                 M = np.mean(X, axis=0)
@@ -364,30 +381,66 @@ def genpca(
 
                 if sigma is None:
                     # Random matrix theory
-                    this_var, _ = _pca_classifier(d, num_samples)
+                    if not(IMG_SAMPLES):
+                        this_var, _ = _pca_classifier(d, num_samples)
+                    else:
+                        #this_var, _ = _pca_classifier(d, dim)  # NOTE: I had forgotten to adjust this! MAYBE ISSUE IF FEWER SAMPLES THAN FEATURES
+                        #this_var, _ = _pca_classifier(d, 36)  # NOTE: I had forgotten to adjust this! MAYBE ISSUE IF FEWER SAMPLES THAN FEATURES
+                        this_var, _ = _pca_classifier(d, 72)  # NOTE: I had forgotten to adjust this! MAYBE ISSUE IF FEWER SAMPLES THAN FEATURES
                 else:
                     # Predefined variance
                     this_var = var[i, j, k]
 
                 # Threshold by tau:
                 tau = tau_factor**2 * this_var
+                print(d)
+
+                # compute the new coords
+                CC = X @ W
+
+                # Plot the PCA coords
+                #import matplotlib.pyplot as plt
+                #plt.scatter(CC[:,-1], CC[:, -2], c=IND)
+                #plt.show()
+
+#                # if they have same bval/bvec, then average the new coords
+#                for ind in np.unique(IND):
+#                    cond = (IND == ind)
+#                    #print(cond)
+#                    #print(CC[cond])
+#                    CC[cond] = CC[cond].mean(axis=0)
+#                    #print(CC[cond])
+#                    #input("wait")
 
                 # Update ncomps according to tau_factor
                 ncomps = np.sum(d < tau)
+                print(ncomps, "/", X.shape[1])
                 W[:, :ncomps] = 0
 
                 # This is equations 1 and 2 in Manjon 2013:
-                Xest = X.dot(W).dot(W.T) + M
+                #Xest = X.dot(W).dot(W.T) + M
+                Xest = CC.dot(W.T) + M
                 # This is equation 3 in Manjon 2013:
                 if not(REFACTOR):
-                    this_theta = 1.0 / (1.0 + dim - ncomps)
-                    Xest = Xest.reshape(patch_size[0], patch_size[1], patch_size[2], dim)
+                    if not(IMG_SAMPLES):
+                        this_theta = 1.0 / (1.0 + dim - ncomps)
+                        Xest = Xest.reshape(patch_size[0], patch_size[1], patch_size[2], dim)
+                    else:
+                        this_theta = 1.0 / (1.0 + Xest.shape[1] - ncomps)
+                        Xest = Xest.T  # NOTE: swap!
+                        Xest = Xest.reshape(patch_size[0], patch_size[1], patch_size[2], dim)
                 else:
                     this_theta = 1.0 / (1.0 + Xest.shape[1] - ncomps)
+                    if IMG_SAMPLES:
+                        Xest = Xest.T  # NOTE: swap!
                     ZEROS = np.zeros([patch_size[0], patch_size[1], patch_size[2], dim])
-                    ZEROS[:, :, 0, 0:72] = Xest[0:25].reshape([5, 5, 72])
-                    ZEROS[:, :, 0, 72:2*72] = Xest[25:50].reshape([5, 5, 72])
-                    ZEROS[:, :, 0, 2*72:] = Xest[50:75].reshape([5, 5, 72])
+                    #for abc in range(6):
+                    #    ZEROS[:, :, 0, (abc)*36:(abc+1)*36] = Xest[abc*9:(abc+1)*9].reshape([3, 3, 36])
+                    for abc in range(3):
+                        ZEROS[:, :, 0, (abc)*72:(abc+1)*72] = Xest[abc*25:(abc+1)*25].reshape([5, 5, 72])
+                    #ZEROS[:, :, 0, 0:72] = Xest[0:25].reshape([5, 5, 72])
+                    #ZEROS[:, :, 0, 72:2*72] = Xest[25:50].reshape([5, 5, 72])
+                    #ZEROS[:, :, 0, 2*72:] = Xest[50:75].reshape([5, 5, 72])
                     Xest = ZEROS
                 theta[ix1:ix2, jx1:jx2, kx1:kx2] += this_theta
                 thetax[ix1:ix2, jx1:jx2, kx1:kx2] += Xest * this_theta
@@ -529,6 +582,7 @@ def mppca(
     return_sigma=False,
     out_dtype=None,
     suppress_warning=False,
+    IND=None
 ):
     r"""Performs PCA-based denoising using the Marcenko-Pastur
     distribution.
@@ -583,4 +637,5 @@ def mppca(
         return_sigma=return_sigma,
         out_dtype=out_dtype,
         suppress_warning=suppress_warning,
+        IND=IND
     )
