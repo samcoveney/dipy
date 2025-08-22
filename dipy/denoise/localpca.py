@@ -306,8 +306,8 @@ def genpca(
     elif isinstance(sigma, (int, float)):
         var = sigma**2 * np.ones(arr.shape[:-1])
 
-    REFACTOR = True
-    IMG_SAMPLES = True
+    REFACTOR = False
+    IMG_SAMPLES = False
     dim = arr.shape[-1]
     if tau_factor is None:
         if not(REFACTOR):
@@ -393,7 +393,7 @@ def genpca(
 
                 # Threshold by tau:
                 tau = tau_factor**2 * this_var
-                print(d)
+                #print(d)
 
                 # compute the new coords
                 CC = X @ W
@@ -414,7 +414,7 @@ def genpca(
 
                 # Update ncomps according to tau_factor
                 ncomps = np.sum(d < tau)
-                print(ncomps, "/", X.shape[1])
+                #print(ncomps, "/", X.shape[1])
                 W[:, :ncomps] = 0
 
                 # This is equations 1 and 2 in Manjon 2013:
